@@ -1,19 +1,13 @@
-Template Service
+platform-integration-tests
 ================================================================================
 
-- [Template Service](#template-service)
+- [platform-integration-tests](#platform-integration-tests)
   - [Service Description](#service-description)
-    - [Name \& responsibility](#name--responsibility)
-    - [Description](#description)
-    - [API Endpoints](#api-endpoints)
-    - [Consumed Events](#consumed-events)
-    - [Published Events](#published-events)
-    - [(Internal) Data states \& persistence model](#internal-data-states--persistence-model)
-    - [Major Business Rules](#major-business-rules)
-    - [Permissions \& Access Control](#permissions--access-control)
-    - [Change Management](#change-management)
-      - [Versioning strategy](#versioning-strategy)
-      - [Release management](#release-management)
+    - [Responsibility](#responsibility)
+    - [Architecture](#architecture)
+    - [What it does](#what-it-does)
+    - [DynamoDB data model](#dynamodb-data-model)
+    - [Pass/Fail rules (Verifier)](#passfail-rules-verifier)
   - [Infrastructure \& Deployment](#infrastructure--deployment)
     - [Stateful](#stateful)
     - [Stateless](#stateless)
@@ -34,65 +28,145 @@ Template Service
 Service Description
 --------------------------------------------------------------------------------
 
-### Name & responsibility
+## Responsibility
 
-### Description
+**Staging guardrail for OrcaBus** — a fast, deterministic integration-testing system that exercises **real orchestration** on the OrcaBus **staging EventBridge bus** without running expensive external workloads. It seeds scenarios, collects emitted events, verifies them against golden fixtures, and emits a single **pass/fail verdict** to gate production in CI/CD.
 
-### API Endpoints
+## Architecture
 
-This service provides a RESTful API following OpenAPI conventions.
-The Swagger documentation of the production endpoint is available here:
-
-
-### Consumed Events
-
-| Name / DetailType | Source         | Schema Link       | Description         |
-|-------------------|----------------|-------------------|---------------------|
-| `SomeServiceStateChange` | `orcabus.someservice` | <schema link> | Announces service state changes |
-
-### Published Events
-
-| Name / DetailType | Source         | Schema Link       | Description         |
-|-------------------|----------------|-------------------|---------------------|
-| `TemplateStateChange` | `orcabus.templatemanager` | <schema link> | Announces Template data state changes |
+![Architecture](./docs/Integration_Testing.drawio.svg)
 
 
-### (Internal) Data states & persistence model
+**Key points**
+- Exactly **one Lambda per role**: `Seeder`, `Collector`, `Verifier`, `Reporter`.
+- A **Step Functions controller** only orchestrates **Seeder + Collector** at start and **Verifier (+ Reporter)** at the end. It **does not** read or write DynamoDB or S3 directly.
+- A **single DynamoDB table** stores **everything** per run: **run metadata**, **fixtures**, **observed events**, and the **final verdict**.
 
-### Major Business Rules
 
-### Permissions & Access Control
 
-### Change Management
+## What it does
 
-#### Versioning strategy
+1. **Test Controller (Step Functions)**
+   On trigger (from **CodePipeline** or manual):
+   - Generate `testId` (aka `runId`).
+   - **Enable** the EventBridge rule that routes **test-mode** events to the Collector.
+   - Invoke **Seeder** and **Collector** (control “start”).
+   - Wait/poll until the run is **ready** (all expected events seen) or **timeout**.
+   - Invoke **Verifier**, then **Reporter**.
+   - **Disable** the Collector rule.
 
-E.g. Manual tagging of git commits following Semantic Versioning (semver) guidelines.
+2. **Seeder (Lambda, Python)**
+   Writes **fixtures (expected events)** for the scenario to DynamoDB and publishes initial **seed event(s)** with `testId`.
 
-#### Release management
+3. **Collector (Lambda, Python)**
+   While the rule is enabled, receives **test-mode** events from EventBridge and archives **all events for `testId`** to DynamoDB (with dedupe).
 
-The service employs a fully automated CI/CD pipeline that automatically builds and releases all changes to the `main` code branch.
+4. **Verifier (Lambda, Python)**
+   When **ready** or **timeout**, loads fixtures + observations and checks **presence, order, schema (optional), duplicates, latency windows**. Writes a **verdict** to DynamoDB.
+
+5. **Reporter (Lambda, Python)**
+   Reads the verdict, builds an **HTML/JSON** report to **S3**, and (optionally) posts to Slack. CI can consume the verdict to approve/block promotion.
+
+
+## DynamoDB data model
+
+**Partition key (PK)**: `runId` (aka `testId`)
+**Sort key (SK)**: typed, prefixed key per item
+
+### Item types
+
+#### 1) Run meta
+- **SK**: `run#meta`
+- **Attributes**
+  - `runId` (S)
+  - `scenario` (S)
+  - `expectedSlots` (N)                // how many expected events/slots
+  - `observedCount` (N)                // incremented by Collector
+  - `status` (S: `running|ready|failed|passed|timeout`)
+  - `startedAt` (S ISO)
+  - `timeoutAt` (S ISO, optional)
+
+---
+
+#### 2) Event
+> One **slot** per expected event. Holds fixture, first observed match (+payload), received time, and **per-slot verdict**.
+
+- **SK**: `slot#seq#000001` *(strict order)* **or** `slot#id#<fixtureId>` *(DAG/causal)*
+- **Attributes**
+  - `runId` (S)
+  - `sk` (S)
+  - `slotType` (S: `seq` or `dag`)
+  - `slotId` (S|N)                    // seq number or fixture id
+  - `expected` (M)
+    - `detailType` (S)
+    - `source` (S, optional)
+    - `seq` (N, optional)             // for linear order
+    - `causedBy` (L of S, optional)   // for DAG edges (eventIds or slotIds)
+    - `payloadHash` (S, optional)
+    - `payloadSample` (S, optional, truncated)
+    - `schemaId` (S, optional)
+  - `observed` (M, **nullable** until matched)
+    - `eventId` (S)
+    - `detailType` (S)
+    - `receivedAt` (S ISO)            // received time
+    - `payloadHash` (S, optional)
+    - `payloadSample` (S, optional/truncated)
+    - `rawS3Key` (S, optional)        // if full bodies live in S3
+  - `verdict` (M)
+    - `status` (S: `pending|matched|missing|mismatch|duplicate|out_of_order`)
+    - `reasons` (L of S)
+    - `latencyMs` (N, optional)
+    - `checkedAt` (S ISO)
+
+---
+
+#### 3) Observed (all) — optional but recommended
+> Store every observed test event for audit/duplicates, even after a slot is matched.
+
+- **SK**: `obs#<time>#<eventId>`
+- **Attributes**
+  - `runId` (S)
+  - `eventId` (S)
+  - `detailType` (S)
+  - `receivedAt` (S ISO)
+  - `payloadHash` (S, optional)
+  - `payloadHead` (S, optional; tiny JSON subset)
+  - `mappedSlotKey` (S, optional)     // `slot#...` if matched
+  - `isDuplicate` (BOOL, optional)
+
+
+## Pass/Fail rules (Verifier)
+
+A run **passes** only if:
+
+- **Presence:** all expected event types/counts observed.
+- **Order:** either strictly increasing `seq` **or** all `sourceService` edges satisfied (topological check).
+- **Payload:** each event detail validates against its expected event details.
+- **Idempotency:** no duplicate `eventId` for the run.
+- **Latency:** each step and overall duration within configured windows.
+
+Run **fails** on any violation; **timeouts** mark missing events explicitly.
 
 
 Infrastructure & Deployment
 --------------------------------------------------------------------------------
 
-Short description with diagrams where appropriate.
-Deployment settings / configuration (e.g. CodePipeline(s) / automated builds).
-
-Infrastructure and deployment are managed via CDK. This template provides two types of CDK entry points: `cdk-stateless` and `cdk-stateful`.
+Infrastructure and deployment are managed via CDK. The system uses AWS CDK to provision all required resources including Lambda functions, Step Functions state machines, DynamoDB tables, S3 buckets, and EventBridge rules. This template provides two types of CDK entry points: `cdk-stateless` and `cdk-stateful`.
 
 
 ### Stateful
 
-- Queues
-- Buckets
-- Database
-- ...
+Stateful resources that persist data across deployments:
+
+- **DynamoDB table** (`platform-it-store`): Stores run metadata, fixtures, observed events, and verdicts
+- **S3 buckets** (`platform-it-store`): Stores full event payloads and test reports
 
 ### Stateless
-- Lambdas
-- StepFunctions
+Stateless resources that can be redeployed without side effects:
+
+- **Lambda functions**: `Seeder`, `Collector`, `Verifier`, and `Reporter`
+- **Step Functions state machine**: Orchestrates the test execution workflow
+- **EventBridge rules**: Routes test-mode events to the Collector
 
 
 ### CDK Commands
@@ -187,11 +261,9 @@ make install
 Before using this template, search for all instances of `TODO:` comments in the codebase and update them as appropriate for your service. This includes replacing placeholder values (such as stack names).
 
 
-### Conventions
-
 ### Linting & Formatting
 
-Automated checks are enforces via pre-commit hooks, ensuring only checked code is committed. For details consult the `.pre-commit-config.yaml` file.
+Automated checks are enforced via pre-commit hooks, ensuring only checked code is committed. For details consult the `.pre-commit-config.yaml` file.
 
 Manual, on-demand checking is also available via `make` targets (see below). For details consult the `Makefile` in the root of the project.
 
@@ -211,7 +283,7 @@ make fix
 ### Testing
 
 
-Unit tests are available for most of the business logic. Test code is hosted alongside business in `/tests/` directories.
+Unit tests are available for most of the business logic. Test code is hosted alongside business logic in `./test` directories.
 
 ```sh
 make test
@@ -226,5 +298,7 @@ Service specific terms:
 
 | Term      | Description                                      |
 |-----------|--------------------------------------------------|
-| Foo | ... |
-| Bar | ... |
+| `testId` / `runId` | Unique identifier for a test execution run |
+| Slot | A placeholder for an expected event, containing both the fixture (expected) and observed event data |
+| Fixture | Expected event data that defines what should be observed during a test run |
+| Verdict | The pass/fail status and reasons for a test run or individual event slot |
