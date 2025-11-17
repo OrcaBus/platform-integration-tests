@@ -9,6 +9,7 @@ cdk.out
 
 # Python
 *__pycache__*
+venv/
 
 # IDE
 .idea
