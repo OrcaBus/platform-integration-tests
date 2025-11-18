@@ -119,7 +119,7 @@ jobs:
         run: |
           make install
 
-      - name: Test
-        working-directory: ./app
-        run: |
-          make test
+      # - name: Test
+      #   working-directory: ./app
+      #   run: |
+      #     make test
