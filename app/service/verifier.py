@@ -48,12 +48,14 @@ def _get_run_meta(run_id: str):
 
 def _get_slots_for_run(run_id: str):
     resp = table.query(
-        KeyConditionExpression=Key("pk").eq(f"run#{run_id}") & Key("sk").begins_with("slot#")
+        KeyConditionExpression=Key("pk").eq(f"run#{run_id}")
+        & Key("sk").begins_with("slot#")
     )
     return resp.get("Items", [])
 
 
 # ---------- STATUS MODE ----------
+
 
 def _status_mode(run_id: str) -> dict:
     """
@@ -131,6 +133,7 @@ def _status_mode(run_id: str) -> dict:
 
 # ---------- VERIFY MODE ----------
 
+
 def _verify_slot(run_meta: dict, slot: dict) -> dict:
     """
     Simple verification:
@@ -203,7 +206,9 @@ def _verify_mode(run_id: str) -> dict:
                 ExpressionAttributeValues={":verdict": verdict},
             )
         except Exception as e:
-            print(f"[Verifier/Verify] Failed to update verdict for {slot['pk']} / {slot['sk']}: {e}")
+            print(
+                f"[Verifier/Verify] Failed to update verdict for {slot['pk']} / {slot['sk']}: {e}"
+            )
 
     print(f"[Verifier/Verify] Slot verdict counts: {dict(slot_status_counts)}")
 
@@ -240,6 +245,7 @@ def _verify_mode(run_id: str) -> dict:
 
 
 # ---------- HANDLER ----------
+
 
 def handler(event, context):
     """

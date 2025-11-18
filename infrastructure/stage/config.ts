@@ -16,9 +16,10 @@ export const getIntegrationTestsHarnessStackProps = (
 ): IntegrationTestsHarnessStackProps => {
   const accountId = stage === 'BETA' ? BETA_ENVIRONMENT.account : GAMMA_ENVIRONMENT.account;
   const region = stage === 'BETA' ? BETA_ENVIRONMENT.region : GAMMA_ENVIRONMENT.region;
+  const stageLower = stage.toLowerCase();
   return {
-    dynamoDBTableName: `orcabus-platform-it-${stage}-store`,
-    s3BucketName: `orcabus-platform-it-${stage}-${accountId}-${region}`,
+    dynamoDBTableName: `orcabus-platform-it-${stageLower}-store`,
+    s3BucketName: `orcabus-platform-it-${stageLower}-${accountId}-${region}`,
     vpcProps: VPC_LOOKUP_PROPS,
     lambdaSecurityGroupName: SHARED_SECURITY_GROUP_NAME,
     mainBusName: EVENT_BUS_NAME,
@@ -30,9 +31,10 @@ export const getIntegrationTestsStorageStackProps = (
 ): IntegrationTestsStorageStackProps => {
   const accountId = stage === 'BETA' ? BETA_ENVIRONMENT.account : GAMMA_ENVIRONMENT.account;
   const region = stage === 'BETA' ? BETA_ENVIRONMENT.region : GAMMA_ENVIRONMENT.region;
+  const stageLower = stage.toLowerCase();
   return {
     stage: stage,
-    bucketName: `orcabus-platform-it-${stage}-${accountId}-${region}`,
-    dynamoDBTableName: `orcabus-platform-it-${stage}-store`,
+    bucketName: `orcabus-platform-it-${stageLower}-${accountId}-${region}`,
+    dynamoDBTableName: `orcabus-platform-it-${stageLower}-store`,
   };
 };

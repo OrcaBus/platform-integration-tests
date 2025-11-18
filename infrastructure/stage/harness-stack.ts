@@ -19,6 +19,7 @@ import {
   IChainable,
   LogLevel,
   JsonPath,
+  DefinitionBody,
 } from 'aws-cdk-lib/aws-stepfunctions';
 import { LambdaInvoke } from 'aws-cdk-lib/aws-stepfunctions-tasks';
 import { LogGroup, RetentionDays } from 'aws-cdk-lib/aws-logs';
@@ -150,7 +151,9 @@ export class IntegrationTestsHarnessStack extends Stack {
     });
 
     return new StateMachine(this, 'StepFunctionsStateMachine', {
-      definition: this.createStepFunctionsControllerFunction(seeder, collector, verifier, reporter),
+      definitionBody: DefinitionBody.fromChainable(
+        this.createStepFunctionsControllerFunction(seeder, collector, verifier, reporter)
+      ),
       stateMachineType: StateMachineType.STANDARD,
       stateMachineName: 'PlatformItStepFunctionsStateMachine',
       timeout: Duration.minutes(10),

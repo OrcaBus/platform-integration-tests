@@ -34,7 +34,9 @@ def _now_iso() -> str:
 
 def _hash_payload(payload) -> str:
     try:
-        return hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()
+        return hashlib.sha256(
+            json.dumps(payload, sort_keys=True).encode("utf-8")
+        ).hexdigest()
     except Exception:
         return ""
 
@@ -45,7 +47,9 @@ def _store_event_payload(run_id: str, event_id: str, full_event: dict) -> str:
     """
     key = f"events/{run_id}/{event_id}.json"
     try:
-        s3.put_object(Bucket=S3_BUCKET, Key=key, Body=json.dumps(full_event).encode("utf-8"))
+        s3.put_object(
+            Bucket=S3_BUCKET, Key=key, Body=json.dumps(full_event).encode("utf-8")
+        )
         return key
     except Exception as e:
         print(f"[Collector] Failed to store event payload to S3: {e}")
@@ -59,7 +63,8 @@ def _get_run_meta(run_id: str):
 
 def _get_slots_for_run(run_id: str):
     resp = table.query(
-        KeyConditionExpression=Key("pk").eq(f"run#{run_id}") & Key("sk").begins_with("slot#")
+        KeyConditionExpression=Key("pk").eq(f"run#{run_id}")
+        & Key("sk").begins_with("slot#")
     )
     return resp.get("Items", [])
 
@@ -121,7 +126,9 @@ def handler(event, context):
     # Find a slot to attach this event to
     slot = _find_slot_for_event(run_id, detail_type)
     if not slot:
-        print(f"[Collector] No matching slot found for runId={run_id}, detailType={detail_type}")
+        print(
+            f"[Collector] No matching slot found for runId={run_id}, detailType={detail_type}"
+        )
         return {
             "runId": run_id,
             "attached": False,

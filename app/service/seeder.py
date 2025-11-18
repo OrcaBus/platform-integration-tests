@@ -25,7 +25,11 @@ s3 = boto3.client("s3")
 
 
 def _now_iso() -> str:
-    return datetime.now(tz=datetime.timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+    return (
+        datetime.now(tz=datetime.timezone.utc)
+        .isoformat(timespec="seconds")
+        .replace("+00:00", "Z")
+    )
 
 
 def _load_fixtures_from_s3(scenario: str):
@@ -51,7 +55,9 @@ def _load_fixtures_from_s3(scenario: str):
         fixtures = json.loads(body)
         return fixtures
     except s3.exceptions.NoSuchKey:
-        print(f"[Seeder] No fixtures found at s3://{S3_BUCKET}/{key}, using inline sample.")
+        print(
+            f"[Seeder] No fixtures found at s3://{S3_BUCKET}/{key}, using inline sample."
+        )
         return None
     except Exception as e:
         print(f"[Seeder] Error loading fixtures from S3: {e}")

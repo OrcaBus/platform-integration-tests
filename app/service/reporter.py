@@ -43,7 +43,8 @@ def _get_run_meta(run_id: str):
 
 def _get_slots_for_run(run_id: str):
     resp = table.query(
-        KeyConditionExpression=Key("pk").eq(f"run#{run_id}") & Key("sk").begins_with("slot#")
+        KeyConditionExpression=Key("pk").eq(f"run#{run_id}")
+        & Key("sk").begins_with("slot#")
     )
     return resp.get("Items", [])
 
@@ -83,9 +84,7 @@ def _build_html_report(run_meta: dict, slots: list, verify_result: dict) -> str:
         "<th>SK</th><th>SlotType</th><th>SlotId</th><th>Expected detailType</th>"
         "<th>#Observed</th><th>Status</th><th>Reasons</th>"
         "</tr></thead>"
-        "<tbody>"
-        + "".join(slot_rows)
-        + "</tbody></table>"
+        "<tbody>" + "".join(slot_rows) + "</tbody></table>"
     )
 
     verify_json = json.dumps(verify_result or {}, indent=2)
@@ -150,7 +149,9 @@ def handler(event, context):
     date_prefix = datetime.utcnow().strftime("%Y-%m-%d")
     key = f"reports/{date_prefix}/{run_id}.html"
 
-    s3.put_object(Bucket=S3_BUCKET, Key=key, ContentType="text/html", Body=html.encode("utf-8"))
+    s3.put_object(
+        Bucket=S3_BUCKET, Key=key, ContentType="text/html", Body=html.encode("utf-8")
+    )
     print(f"[Reporter] Stored report at s3://{S3_BUCKET}/{key}")
 
     # Update run meta with reportS3Key
