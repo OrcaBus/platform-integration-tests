@@ -5,9 +5,8 @@ platform-integration-tests
   - [Service Description](#service-description)
     - [Responsibility](#responsibility)
     - [Architecture](#architecture)
-    - [What it does](#what-it-does)
-    - [DynamoDB data model](#dynamodb-data-model)
-    - [Pass/Fail rules (Verifier)](#passfail-rules-verifier)
+    - [System Component](#system-component)
+    - [CI/CD Integration](#cicd-integration)
   - [Infrastructure \& Deployment](#infrastructure--deployment)
     - [Stateful](#stateful)
     - [Stateless](#stateless)
@@ -43,17 +42,51 @@ Service Description
 - A **single DynamoDB table** stores **everything** per run: **run metadata**, **fixtures**, **observed events**, and the **final verdict**.
 
 
+### high levelArchitecture
 
-## What it does
+1. CI/CD deploys OrcaBus to **staging**.
+2. CI/CD triggers the **test controller** (AWS Step Functions).
+3. The controller:
+   - Creates a unique `testId` and marks the run as **test mode**.
+   - Seeds a scenario via the **Seeder Lambda**.
+   - Collects all test-mode events via the **Collector Lambda**.
+   - Waits until all expected events arrive or a timeout occurs.
+   - Invokes the **Verifier Lambda** to compute a verdict.
+   - Invokes the **Reporter Lambda** to publish a report.
+4. CI/CD reads the verdict and **allows or blocks promotion to production**.
+
+### AWS Services
+
+- **AWS Step Functions**
+  - Orchestrates a single integration test run end-to-end.
+  - Does **not** access DynamoDB or S3 directly; all logic is in Lambdas.
+
+- **AWS Lambda** (Python)
+  - `Seeder` – seeds fixtures and initial events.
+  - `Collector` – archives test-mode events for the current run.
+  - `Verifier` – compares fixtures vs. observations and writes verdict.
+  - `Reporter` – creates a human-readable report and optionally posts notifications.
+
+
+- **Amazon DynamoDB**
+  - **Single table** that stores:
+    - Run metadata
+    - Fixtures
+    - Observed events
+    - Final verdict
+    - (Optional) report metadata
+
+- **Amazon S3**
+  - Stores HTML/JSON reports for each run.
+  - Optionally store full-size event payloads if they are large.
+
+## System Component
 
 1. **Test Controller (Step Functions)**
    On trigger (from **CodePipeline** or manual):
-   - Generate `testId` (aka `runId`).
-   - **Enable** the EventBridge rule that routes **test-mode** events to the Collector.
    - Invoke **Seeder** and **Collector** (control “start”).
    - Wait/poll until the run is **ready** (all expected events seen) or **timeout**.
    - Invoke **Verifier**, then **Reporter**.
-   - **Disable** the Collector rule.
 
 2. **Seeder (Lambda, Python)**
    Writes **fixtures (expected events)** for the scenario to DynamoDB and publishes initial **seed event(s)** with `testId`.
@@ -67,85 +100,23 @@ Service Description
 5. **Reporter (Lambda, Python)**
    Reads the verdict, builds an **HTML/JSON** report to **S3**, and (optionally) posts to Slack. CI can consume the verdict to approve/block promotion.
 
+## CI/CD Integration
 
-## DynamoDB data model
+Typical CodePipeline flow:
 
-**Partition key (PK)**: `runId` (aka `testId`)
-**Sort key (SK)**: typed, prefixed key per item
+1. **Build & unit tests**
+2. **Deploy OrcaBus to staging**
+3. **Run integration harness** (this system)
+   - Action calls the Step Functions controller with:
+     - `scenario` (or multiple scenarios)
+   - Waits for the SFN execution to finish.
+4. **Decision**
+   - If `verdict = "passed"`:
+     - Proceed to production deploy.
+   - If `verdict = "failed"`:
+     - Fail the pipeline or require manual approval.
+5. **Deploy to production (after manual approve)**
 
-### Item types
-
-#### 1) Run meta
-- **SK**: `run#meta`
-- **Attributes**
-  - `runId` (S)
-  - `scenario` (S)
-  - `expectedSlots` (N)                // how many expected events/slots
-  - `observedCount` (N)                // incremented by Collector
-  - `status` (S: `running|ready|failed|passed|timeout`)
-  - `startedAt` (S ISO)
-  - `timeoutAt` (S ISO, optional)
-
----
-
-#### 2) Event
-> One **slot** per expected event. Holds fixture, first observed match (+payload), received time, and **per-slot verdict**.
-
-- **SK**: `slot#seq#000001` *(strict order)* **or** `slot#id#<fixtureId>` *(DAG/causal)*
-- **Attributes**
-  - `runId` (S)
-  - `sk` (S)
-  - `slotType` (S: `seq` or `dag`)
-  - `slotId` (S|N)                    // seq number or fixture id
-  - `expected` (M)
-    - `detailType` (S)
-    - `source` (S, optional)
-    - `seq` (N, optional)             // for linear order
-    - `causedBy` (L of S, optional)   // for DAG edges (eventIds or slotIds)
-    - `payloadHash` (S, optional)
-    - `payloadSample` (S, optional, truncated)
-    - `schemaId` (S, optional)
-  - `observed` (M, **nullable** until matched)
-    - `eventId` (S)
-    - `detailType` (S)
-    - `receivedAt` (S ISO)            // received time
-    - `payloadHash` (S, optional)
-    - `payloadSample` (S, optional/truncated)
-    - `rawS3Key` (S, optional)        // if full bodies live in S3
-  - `verdict` (M)
-    - `status` (S: `pending|matched|missing|mismatch|duplicate|out_of_order`)
-    - `reasons` (L of S)
-    - `latencyMs` (N, optional)
-    - `checkedAt` (S ISO)
-
----
-
-#### 3) Observed (all) — optional but recommended
-> Store every observed test event for audit/duplicates, even after a slot is matched.
-
-- **SK**: `obs#<time>#<eventId>`
-- **Attributes**
-  - `runId` (S)
-  - `eventId` (S)
-  - `detailType` (S)
-  - `receivedAt` (S ISO)
-  - `payloadHash` (S, optional)
-  - `payloadHead` (S, optional; tiny JSON subset)
-  - `mappedSlotKey` (S, optional)     // `slot#...` if matched
-  - `isDuplicate` (BOOL, optional)
-
-
-## Pass/Fail rules (Verifier)
-
-A run **passes** only if:
-
-- **Presence:** all expected event types/counts observed.
-- **Order:** either strictly increasing `seq` **or** all `sourceService` edges satisfied (topological check).
-- **Payload:** each event detail validates against its expected event details.
-- **Idempotency:** no duplicate `eventId` for the run.
-- **Latency:** each step and overall duration within configured windows.
-
-Run **fails** on any violation; **timeouts** mark missing events explicitly.
 
 
 Infrastructure & Deployment
