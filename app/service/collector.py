@@ -1,239 +1,176 @@
+# app/service/collector.py
 """
-Collector Lambda Function
+Collector
 
-Listens to OrcaBus events and archives all events for a runId into DynamoDB.
-Deduplicates by eventId to avoid storing the same event twice.
+Event mode (triggered by EventBridge rule):
+   - EventBridge sends events with detail.testMode = true.
+   - Collector:
+     - Maps event to a slot (naive matching by detailType for now).
+     - Appends an entry to observedEvents.
+     - If first observed event for that slot, increments observedCount on run meta.
+     - Optionally stores full event payload in S3.
+
 """
 
 import hashlib
 import json
 import os
-from datetime import datetime, timezone
-from typing import Any, Dict, List
+from datetime import datetime
 
 import boto3
+from boto3.dynamodb.conditions import Key
 
-# Initialize clients
-dynamodb = boto3.resource('dynamodb')
+TABLE_NAME = os.environ["TABLE_NAME"]
+S3_BUCKET = os.environ["S3_BUCKET"]
 
-# Environment variables
-TABLE_NAME = os.environ.get('TABLE_NAME', 'platform-it-store')
-
-
-def compute_payload_hash(payload: Dict[str, Any]) -> str:
-    """Compute SHA256 hash of payload for idempotency checking."""
-    payload_str = json.dumps(payload, sort_keys=True)
-    return hashlib.sha256(payload_str.encode()).hexdigest()
+dynamodb = boto3.resource("dynamodb")
+table = dynamodb.Table(TABLE_NAME)
+s3 = boto3.client("s3")
 
 
-def format_sort_key(seq: int = None, timestamp: str = None) -> str:
-    """
-    Format sort key for event storage.
-    Uses seq if available, otherwise uses timestamp.
-    """
-    if seq is not None:
-        return f"event#seq{seq:06d}"
-    elif timestamp:
-        return f"event#ts#{timestamp}"
-    else:
-        # Fallback to current timestamp
-        now = datetime.now(timezone.utc).isoformat()
-        return f"event#ts#{now}"
+def _now_iso() -> str:
+    return datetime.utcnow().isoformat(timespec="seconds") + "Z"
 
 
-def store_event(
-    run_id: str,
-    event_id: str,
-    event_type: str,
-    received_at: str,
-    payload: Dict[str, Any],
-    seq: int = None,
-    caused_by: str = None,
-    source: str = None,
-) -> bool:
-    """
-    Store an event in DynamoDB with idempotency check.
-    Returns True if event was stored, False if it was a duplicate.
-    """
-    table = dynamodb.Table(TABLE_NAME)
-
-    # Compute payload hash
-    payload_hash = compute_payload_hash(payload)
-
-    # Format sort key
-    sk = format_sort_key(seq=seq, timestamp=received_at)
-
-    # Prepare item
-    item = {
-        'runId': run_id,
-        'sk': sk,
-        'eventId': event_id,
-        'eventType': event_type,
-        'receivedAt': received_at,
-        'payloadHash': f"sha256:{payload_hash}",
-        'payload': payload,
-    }
-
-    if seq is not None:
-        item['seq'] = seq
-
-    if caused_by:
-        item['causedBy'] = caused_by
-    elif source:
-        item['causedBy'] = source
-
-    # Use conditional put to ensure idempotency (only insert if eventId doesn't exist)
+def _hash_payload(payload) -> str:
     try:
-        table.put_item(
-            Item=item,
-            ConditionExpression='attribute_not_exists(eventId) OR eventId = :eventId',
-            ExpressionAttributeValues={':eventId': event_id},
-        )
-        return True
-    except dynamodb.meta.client.exceptions.ConditionalCheckFailedException:
-        # Event already exists (duplicate)
-        print(f'Duplicate event detected: {event_id}')
-        return False
+        return hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()
+    except Exception:
+        return ""
 
 
-def is_run_active(run_id: str) -> bool:
-    """Check if a run is still active (not completed or timed out)."""
-    table = dynamodb.Table(TABLE_NAME)
-
+def _store_event_payload(run_id: str, event_id: str, full_event: dict) -> str:
+    """
+    Store the full EventBridge event in S3 and return the key.
+    """
+    key = f"events/{run_id}/{event_id}.json"
     try:
-        response = table.get_item(
-            Key={
-                'runId': run_id,
-                'sk': 'run#meta',
-            }
-        )
-
-        if 'Item' not in response:
-            return False
-
-        status = response['Item'].get('status', 'unknown')
-        return status == 'running'
-
+        s3.put_object(Bucket=S3_BUCKET, Key=key, Body=json.dumps(full_event).encode("utf-8"))
+        return key
     except Exception as e:
-        print(f'Error checking run status: {str(e)}')
-        return False
+        print(f"[Collector] Failed to store event payload to S3: {e}")
+        return ""
 
 
-def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
+def _get_run_meta(run_id: str):
+    resp = table.get_item(Key={"pk": f"run#{run_id}", "sk": "run#meta"})
+    return resp.get("Item")
+
+
+def _get_slots_for_run(run_id: str):
+    resp = table.query(
+        KeyConditionExpression=Key("pk").eq(f"run#{run_id}") & Key("sk").begins_with("slot#")
+    )
+    return resp.get("Items", [])
+
+
+def _find_slot_for_event(run_id: str, detail_type: str):
     """
-    Lambda handler for Collector.
+    Naive mapping: find the first slot whose expected.detailType matches
+    and that still has zero observedEvents. Replace with your own logic later.
+    """
+    slots = _get_slots_for_run(run_id)
+    chosen = None
+    for slot in slots:
+        expected = slot.get("expected", {}) or {}
+        if expected.get("detailType") == detail_type:
+            if not slot.get("observedEvents"):
+                return slot
+            if chosen is None:
+                chosen = slot
+    return chosen
 
-    This function is typically triggered by EventBridge rule that filters
-    events from OrcaBus with testMode=true.
 
-    Expected event structure (EventBridge event):
+def handler(event, context):
+    """
+    This Lambda is triggered by EventBridge rule with testMode=true.
+
+    EventBridge event shape:
     {
-        "source": "platform-integration-tests.seeder",
-        "detail-type": "stepA.started",
-        "detail": {
-            "runId": "uuid",
-            "scenario": "happy-path-01",
-            "eventId": "uuid",
-            "schemaVersion": "v1",
-            "seq": 1,
-            "testMode": true,
-            ...
-        }
+      "id": "...",
+      "source": "...",
+      "detail-type": "...",
+      "detail": {
+        "testMode": true,
+        "testId": "<runId>",
+        ...
+      },
+      ...
     }
     """
-    try:
-        # Extract event detail (EventBridge format)
-        if 'detail' in event:
-            detail = event['detail']
-        else:
-            # Direct invocation format
-            detail = event
+    print(f"[Collector] EventBridge event: {json.dumps(event)}")
 
-        # Extract required fields
-        run_id = detail.get('runId')
-        event_id = detail.get('eventId')
-        event_type = detail.get('eventType') or event.get('detail-type')
-        test_mode = detail.get('testMode', False)
+    detail = event.get("detail") or {}
+    run_id = detail.get("testId")
+    if not run_id:
+        print("[Collector] No testId in event.detail, ignoring.")
+        return {"ignored": True, "reason": "no_testId"}
 
-        if not run_id or not event_id:
-            return {
-                'statusCode': 400,
-                'body': json.dumps({
-                    'error': 'Missing required fields: runId or eventId',
-                }),
-            }
+    run_meta = _get_run_meta(run_id)
+    if not run_meta:
+        print(f"[Collector] No run meta found for runId={run_id}, ignoring event.")
+        return {"ignored": True, "reason": "no_run_meta", "runId": run_id}
 
-        # Only process test mode events
-        if not test_mode:
-            return {
-                'statusCode': 200,
-                'body': json.dumps({
-                    'message': 'Skipping non-test event',
-                }),
-            }
+    event_id = event.get("id", "")
+    detail_type = event.get("detail-type", "")
 
-        # Check if run is still active
-        if not is_run_active(run_id):
-            print(f'Run {run_id} is not active, skipping event {event_id}')
-            return {
-                'statusCode': 200,
-                'body': json.dumps({
-                    'message': f'Run {run_id} is not active',
-                }),
-            }
+    # Store full payload in S3 (optional)
+    s3_key = _store_event_payload(run_id, event_id, event)
+    payload_hash = _hash_payload(detail)
 
-        # Extract additional fields
-        seq = detail.get('seq')
-        source = detail.get('source')
-        caused_by = detail.get('causedBy') or source
-        received_at = datetime.now(timezone.utc).isoformat()
-
-        # Extract payload (everything except metadata fields)
-        metadata_fields = {
-            'runId', 'scenario', 'eventId', 'schemaVersion', 'seq',
-            'source', 'causedBy', 'testMode', 'eventType',
-        }
-        payload = {k: v for k, v in detail.items() if k not in metadata_fields}
-
-        # Store event
-        stored = store_event(
-            run_id=run_id,
-            event_id=event_id,
-            event_type=event_type,
-            received_at=received_at,
-            payload=payload,
-            seq=seq,
-            caused_by=caused_by,
-            source=source,
-        )
-
-        if stored:
-            return {
-                'statusCode': 200,
-                'body': json.dumps({
-                    'message': 'Event stored successfully',
-                    'runId': run_id,
-                    'eventId': event_id,
-                    'eventType': event_type,
-                }),
-            }
-        else:
-            return {
-                'statusCode': 200,
-                'body': json.dumps({
-                    'message': 'Duplicate event skipped',
-                    'runId': run_id,
-                    'eventId': event_id,
-                }),
-            }
-
-    except Exception as e:
-        print(f'Error in collector: {str(e)}')
-        import traceback
-        traceback.print_exc()
+    # Find a slot to attach this event to
+    slot = _find_slot_for_event(run_id, detail_type)
+    if not slot:
+        print(f"[Collector] No matching slot found for runId={run_id}, detailType={detail_type}")
         return {
-            'statusCode': 500,
-            'body': json.dumps({
-                'error': str(e),
-            }),
+            "runId": run_id,
+            "attached": False,
+            "reason": "no_matching_slot",
         }
+
+    slot_pk = slot["pk"]
+    slot_sk = slot["sk"]
+    observed_events = slot.get("observedEvents", [])
+    is_first_for_slot = len(observed_events) == 0
+
+    new_observed = {
+        "eventId": event_id,
+        "detailType": detail_type,
+        "receivedAt": _now_iso(),
+        "payloadHash": payload_hash or None,
+        "rawS3Key": s3_key or None,
+        "matchReason": "detailType",
+    }
+
+    # Update slot: append to observedEvents
+    try:
+        table.update_item(
+            Key={"pk": slot_pk, "sk": slot_sk},
+            UpdateExpression="SET observedEvents = list_append(if_not_exists(observedEvents, :empty), :new)",
+            ExpressionAttributeValues={
+                ":empty": [],
+                ":new": [new_observed],
+            },
+        )
+        print(f"[Collector] Appended observed event to {slot_pk} / {slot_sk}")
+    except Exception as e:
+        print(f"[Collector] Failed to update slot item: {e}")
+        return {"runId": run_id, "attached": False, "error": str(e)}
+
+    # If first event for this slot, increment observedCount on run meta
+    if is_first_for_slot:
+        try:
+            table.update_item(
+                Key={"pk": f"run#{run_id}", "sk": "run#meta"},
+                UpdateExpression="SET observedCount = if_not_exists(observedCount, :zero) + :one",
+                ExpressionAttributeValues={":zero": 0, ":one": 1},
+            )
+            print(f"[Collector] Incremented observedCount for runId={run_id}")
+        except Exception as e:
+            print(f"[Collector] Failed to increment observedCount: {e}")
+
+    return {
+        "runId": run_id,
+        "slotKey": {"pk": slot_pk, "sk": slot_sk},
+        "attached": True,
+    }

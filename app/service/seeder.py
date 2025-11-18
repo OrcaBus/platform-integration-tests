@@ -1,233 +1,169 @@
+# app/service/seeder.py
 """
 Seeder Lambda Function
 
-Publishes scenario seed events to the OrcaBus staging test bus.
-Each event is tagged with runId, eventId, schemaVersion, and seq (strict order).
+- Create run#meta item
+- Create one slot item per fixture
+- Emit initial seed event to EventBridge (testMode=True, testId=runId)
 """
 
-import json
 import os
+import json
 import uuid
-from datetime import datetime, timezone
-from typing import Any, Dict, List
+from datetime import datetime, timedelta
 
 import boto3
 
-# Initialize clients
-eventbridge = boto3.client('events')
-dynamodb = boto3.resource('dynamodb')
+TABLE_NAME = os.environ["TABLE_NAME"]
+EVENT_BUS_NAME = os.environ["EVENT_BUS_NAME"]
+S3_BUCKET = os.environ["S3_BUCKET"]
 
-# Environment variables
-TABLE_NAME = os.environ.get('TABLE_NAME', 'platform-it-store')
-ORCABUS_BUS_NAME = os.environ.get('ORCABUS_BUS_NAME', 'staging-test-bus')
-SCHEMA_VERSION = os.environ.get('SCHEMA_VERSION', 'v1')
-
-
-def generate_run_id() -> str:
-    """Generate a unique run ID."""
-    return str(uuid.uuid4())
+dynamodb = boto3.resource("dynamodb")
+table = dynamodb.Table(TABLE_NAME)
+events_client = boto3.client("events")
+s3 = boto3.client("s3")
 
 
-def generate_event_id() -> str:
-    """Generate a unique event ID."""
-    return str(uuid.uuid4())
+def _now_iso() -> str:
+    return datetime.now(tz=datetime.timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
 
 
-def load_scenario_fixtures(scenario: str) -> List[Dict[str, Any]]:
+def _load_fixtures_from_s3(scenario: str):
     """
-    Load expected fixtures for a scenario.
-    In a real implementation, this might load from a fixtures file or DynamoDB.
-    For now, returns a simple example scenario.
+    Try to load fixtures from S3 at key: fixtures/<scenario>.json
+
+    Expected format:
+    [
+      {
+        "detailType": "...",
+        "source": "...",
+        "payloadHash": "...",  # optional
+        "rawS3Key": "...",     # optional
+        ...
+      },
+      ...
+    ]
     """
-    # Example scenarios - in production, load from fixtures directory or DynamoDB
-    scenarios = {
-        'happy-path-01': [
-            {
-                'eventType': 'stepA.started',
-                'seq': 1,
-                'payload': {'action': 'start', 'step': 'A'},
-            },
-            {
-                'eventType': 'stepA.completed',
-                'seq': 2,
-                'payload': {'action': 'complete', 'step': 'A', 'result': 'success'},
-            },
-            {
-                'eventType': 'stepB.started',
-                'seq': 3,
-                'payload': {'action': 'start', 'step': 'B'},
-            },
-            {
-                'eventType': 'stepB.completed',
-                'seq': 4,
-                'payload': {'action': 'complete', 'step': 'B', 'result': 'success'},
-            },
-        ],
+    key = f"fixtures/{scenario}.json"
+    try:
+        obj = s3.get_object(Bucket=S3_BUCKET, Key=key)
+        body = obj["Body"].read()
+        fixtures = json.loads(body)
+        return fixtures
+    except s3.exceptions.NoSuchKey:
+        print(f"[Seeder] No fixtures found at s3://{S3_BUCKET}/{key}, using inline sample.")
+        return None
+    except Exception as e:
+        print(f"[Seeder] Error loading fixtures from S3: {e}")
+        return None
+
+
+def _inline_sample_fixtures():
+    """
+    Very simple sample fixtures for local/dev.
+    Replace with your own or rely on S3-based fixtures.
+    """
+    return [
+        {
+            "detailType": "orcabus.sample.step1",
+            "source": "orcabus.integration.test",
+            "payloadHash": None,
+            "rawS3Key": None,
+        },
+        {
+            "detailType": "orcabus.sample.step2",
+            "source": "orcabus.integration.test",
+            "payloadHash": None,
+            "rawS3Key": None,
+        },
+    ]
+
+
+def handler(event, context):
+    """
+    Expected Step Functions input:
+    {
+      "runId": "<uuid or pipeline-provided>",
+      "scenario": "daily-batch-orchestration",
+      ... (other fields ignored)
     }
 
-    return scenarios.get(scenario, [])
+    Seeder will:
+    - Create run#meta item
+    - Create one slot item per fixture
+    - Emit initial seed event to EventBridge (testMode=true, testId=runId)
+    """
+    print(f"[Seeder] Event: {json.dumps(event)}")
 
+    run_id = event.get("runId") or str(uuid.uuid4())
+    scenario = event.get("scenario", "default-scenario")
 
-def store_run_metadata(run_id: str, scenario: str, expected_count: int, timeout_seconds: int = 300):
-    """Store run metadata in DynamoDB."""
-    table = dynamodb.Table(TABLE_NAME)
-    now = datetime.now(timezone.utc).isoformat()
-    timeout_at = (datetime.now(timezone.utc).timestamp() + timeout_seconds).isoformat()
+    # 1. Load fixtures (S3 first, then inline fallback)
+    fixtures = _load_fixtures_from_s3(scenario)
+    if fixtures is None:
+        fixtures = _inline_sample_fixtures()
 
-    table.put_item(
-        Item={
-            'runId': run_id,
-            'sk': 'run#meta',
-            'scenario': scenario,
-            'expectedCount': expected_count,
-            'status': 'running',
-            'startedAt': now,
-            'timeoutAt': timeout_at,
-            'ttl': int(datetime.now(timezone.utc).timestamp()) + (timeout_seconds * 2),  # Cleanup after 2x timeout
-        }
-    )
+    expected_slots = len(fixtures)
+    now = datetime.utcnow()
+    started_at = _now_iso()
+    timeout_at = (now + timedelta(minutes=2)).isoformat(timespec="seconds") + "Z"
 
+    # 2. Create run meta item
+    meta_item = {
+        "pk": f"run#{run_id}",
+        "sk": "run#meta",
+        "runId": run_id,
+        "scenario": scenario,
+        "expectedSlots": expected_slots,
+        "observedCount": 0,
+        "status": "running",
+        "startedAt": started_at,
+        "timeoutAt": timeout_at,
+    }
+    table.put_item(Item=meta_item)
+    print(f"[Seeder] Created run meta for {run_id}")
 
-def store_fixtures(run_id: str, scenario: str, fixtures: List[Dict[str, Any]]):
-    """Store expected fixtures in DynamoDB."""
-    table = dynamodb.Table(TABLE_NAME)
-
-    for idx, fixture in enumerate(fixtures):
-        table.put_item(
-            Item={
-                'runId': run_id,
-                'sk': f"fixture#{fixture['eventType']}#{idx}",
-                'eventType': fixture['eventType'],
-                'seq': fixture.get('seq'),
-                'expectedPayload': fixture.get('payload', {}),
-                'scenario': scenario,
+    # 3. Create slot items
+    with table.batch_writer() as batch:
+        for idx, fixture in enumerate(fixtures, start=1):
+            slot_item = {
+                "pk": f"run#{run_id}",
+                "sk": f"slot#seq#{idx:06d}",
+                "runId": run_id,
+                "slotType": "seq",
+                "slotId": idx,
+                "expected": fixture,
+                "observedEvents": [],
+                "verdict": {
+                    "status": "pending",
+                    "reasons": [],
+                },
             }
-        )
+            batch.put_item(Item=slot_item)
+    print(f"[Seeder] Wrote {expected_slots} slot items for run {run_id}")
 
-
-def publish_event_to_orcabus(
-    run_id: str,
-    event_id: str,
-    scenario: str,
-    event_type: str,
-    seq: int,
-    source: str = None,
-    payload: Dict[str, Any] = None,
-) -> None:
-    """
-    Publish an event to OrcaBus (EventBridge custom bus).
-    """
-    event_detail = {
-        'runId': run_id,
-        'scenario': scenario,
-        'eventId': event_id,
-        'schemaVersion': SCHEMA_VERSION,
-        'seq': seq,
-        'testMode': True,
-        'eventType': event_type,
+    # 4. Emit seed event to EventBridge (testMode=true)
+    detail = {
+        "testMode": True,
+        "testId": run_id,
+        "scenario": scenario,
     }
-
-    if source:
-        event_detail['source'] = source
-
-    if payload:
-        event_detail.update(payload)
-
-    # Publish to EventBridge custom bus
-    eventbridge.put_events(
+    events_client.put_events(
         Entries=[
             {
-                'Source': 'platform-integration-tests.seeder',
-                'DetailType': event_type,
-                'Detail': json.dumps(event_detail),
-                'EventBusName': ORCABUS_BUS_NAME,
+                "Source": "orcabus.integration.test-harness",
+                "DetailType": "orcabus.integration.seed",
+                "EventBusName": EVENT_BUS_NAME,
+                "Detail": json.dumps(detail),
             }
         ]
     )
+    print(f"[Seeder] Sent seed event for run {run_id} to bus {EVENT_BUS_NAME}")
 
-
-def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
-    """
-    Lambda handler for Seeder.
-
-    Expected event structure:
-    {
-        "scenario": "happy-path-01",
-        "timeoutSeconds": 300  # optional, default 300
+    return {
+        "runId": run_id,
+        "scenario": scenario,
+        "expectedSlots": expected_slots,
+        "startedAt": started_at,
+        "timeoutAt": timeout_at,
     }
-    """
-    try:
-        # Extract parameters
-        scenario = event.get('scenario', 'happy-path-01')
-        timeout_seconds = event.get('timeoutSeconds', 300)
-
-        # Generate run ID
-        run_id = generate_run_id()
-
-        # Load scenario fixtures
-        fixtures = load_scenario_fixtures(scenario)
-        if not fixtures:
-            return {
-                'statusCode': 400,
-                'body': json.dumps({
-                    'error': f'Scenario "{scenario}" not found',
-                    'runId': run_id,
-                }),
-            }
-
-        expected_count = len(fixtures)
-
-        # Store run metadata
-        store_run_metadata(run_id, scenario, expected_count, timeout_seconds)
-
-        # Store fixtures
-        store_fixtures(run_id, scenario, fixtures)
-
-        # Publish events to OrcaBus
-        previous_event_id = None
-        published_events = []
-
-        for fixture in fixtures:
-            event_id = generate_event_id()
-            seq = fixture.get('seq', 0)
-            event_type = fixture['eventType']
-            payload = fixture.get('payload', {})
-
-            # Publish to OrcaBus
-            publish_event_to_orcabus(
-                run_id=run_id,
-                event_id=event_id,
-                scenario=scenario,
-                event_type=event_type,
-                seq=seq,
-                source=previous_event_id,
-                payload=payload,
-            )
-
-            published_events.append({
-                'eventId': event_id,
-                'eventType': event_type,
-                'seq': seq,
-            })
-
-            previous_event_id = event_id
-
-        return {
-            'statusCode': 200,
-            'body': json.dumps({
-                'runId': run_id,
-                'scenario': scenario,
-                'expectedCount': expected_count,
-                'publishedEvents': published_events,
-                'message': f'Successfully seeded {len(published_events)} events',
-            }),
-        }
-
-    except Exception as e:
-        print(f'Error in seeder: {str(e)}')
-        return {
-            'statusCode': 500,
-            'body': json.dumps({
-                'error': str(e),
-            }),
-        }

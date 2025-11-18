@@ -9,7 +9,7 @@ import { BillingMode } from 'aws-cdk-lib/aws-dynamodb';
 export interface IntegrationTestsStorageStackProps {
   readonly stage: StageName;
   readonly bucketName: string;
-  readonly tableName: string;
+  readonly dynamoDBTableName: string;
 }
 
 export class IntegrationTestsStorageStack extends Stack {
@@ -20,9 +20,9 @@ export class IntegrationTestsStorageStack extends Stack {
   ) {
     super(scope, id, props);
 
-    // --- Storage ---
+    // --- dynamodb table ---
     new Table(this, 'PlatformItStoreDynamoDB', {
-      tableName: props?.tableName,
+      tableName: props?.dynamoDBTableName,
       partitionKey: { name: 'testId', type: AttributeType.STRING },
       sortKey: { name: 'sk', type: AttributeType.STRING },
       billingMode: BillingMode.PAY_PER_REQUEST,
@@ -30,6 +30,7 @@ export class IntegrationTestsStorageStack extends Stack {
       removalPolicy: RemovalPolicy.DESTROY,
     });
 
+    // --- s3 bucket ---
     new Bucket(this, `PlatformItStoreS3`, {
       bucketName: props?.bucketName,
       removalPolicy: RemovalPolicy.DESTROY,

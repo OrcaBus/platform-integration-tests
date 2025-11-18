@@ -1,3 +1,5 @@
+# app/service/verifier.py
+
 """
 Verifier Lambda Function
 
@@ -14,409 +16,255 @@ Writes the verdict to DynamoDB.
 
 import json
 import os
+from collections import Counter
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Tuple
 
 import boto3
+from boto3.dynamodb.conditions import Key
 
-# Initialize clients
-dynamodb = boto3.resource('dynamodb')
+TABLE_NAME = os.environ["TABLE_NAME"]
 
-# Environment variables
-TABLE_NAME = os.environ.get('TABLE_NAME', 'platform-it-store')
-MAX_LATENCY_MS = int(os.environ.get('MAX_LATENCY_MS', '60000'))  # 60 seconds default
+dynamodb = boto3.resource("dynamodb")
+table = dynamodb.Table(TABLE_NAME)
 
 
-def load_run_metadata(run_id: str) -> Optional[Dict[str, Any]]:
-    """Load run metadata from DynamoDB."""
-    table = dynamodb.Table(TABLE_NAME)
+def _now_iso() -> str:
+    return datetime.utcnow().isoformat(timespec="seconds") + "Z"
 
+
+def _parse_iso(dt_str: str):
     try:
-        response = table.get_item(
-            Key={
-                'runId': run_id,
-                'sk': 'run#meta',
-            }
-        )
-        return response.get('Item')
-    except Exception as e:
-        print(f'Error loading run metadata: {str(e)}')
+        if dt_str.endswith("Z"):
+            dt_str = dt_str[:-1]
+        return datetime.fromisoformat(dt_str).replace(tzinfo=timezone.utc)
+    except Exception:
         return None
 
 
-def load_fixtures(run_id: str) -> List[Dict[str, Any]]:
-    """Load all expected fixtures for a run."""
-    table = dynamodb.Table(TABLE_NAME)
-
-    try:
-        response = table.query(
-            KeyConditionExpression='runId = :runId AND begins_with(sk, :prefix)',
-            ExpressionAttributeValues={
-                ':runId': run_id,
-                ':prefix': 'fixture#',
-            }
-        )
-        return response.get('Items', [])
-    except Exception as e:
-        print(f'Error loading fixtures: {str(e)}')
-        return []
+def _get_run_meta(run_id: str):
+    resp = table.get_item(Key={"pk": f"run#{run_id}", "sk": "run#meta"})
+    return resp.get("Item")
 
 
-def load_observed_events(run_id: str) -> List[Dict[str, Any]]:
-    """Load all observed events for a run."""
-    table = dynamodb.Table(TABLE_NAME)
-
-    try:
-        response = table.query(
-            KeyConditionExpression='runId = :runId AND begins_with(sk, :prefix)',
-            ExpressionAttributeValues={
-                ':runId': run_id,
-                ':prefix': 'event#',
-            }
-        )
-        return response.get('Items', [])
-    except Exception as e:
-        print(f'Error loading observed events: {str(e)}')
-        return []
-
-
-def check_presence(fixtures: List[Dict[str, Any]], events: List[Dict[str, Any]]) -> Tuple[bool, List[str]]:
-    """
-    Check if all expected events are present.
-    Returns (passed, missing_events).
-    """
-    # Group fixtures by eventType
-    expected_by_type = {}
-    for fixture in fixtures:
-        event_type = fixture.get('eventType')
-        if event_type:
-            expected_by_type[event_type] = expected_by_type.get(event_type, 0) + 1
-
-    # Count observed events by type
-    observed_by_type = {}
-    for event in events:
-        event_type = event.get('eventType')
-        if event_type:
-            observed_by_type[event_type] = observed_by_type.get(event_type, 0) + 1
-
-    # Check for missing events
-    missing = []
-    for event_type, expected_count in expected_by_type.items():
-        observed_count = observed_by_type.get(event_type, 0)
-        if observed_count < expected_count:
-            missing.append(f"{event_type} (expected {expected_count}, got {observed_count})")
-
-    return len(missing) == 0, missing
-
-
-def check_order(fixtures: List[Dict[str, Any]], events: List[Dict[str, Any]]) -> Tuple[bool, List[str]]:
-    """
-    Check event ordering.
-    Supports both seq-based (strictly increasing) and causedBy-based (DAG) ordering.
-    Returns (passed, violations).
-    """
-    violations = []
-
-    # Sort events by seq if available
-    events_with_seq = [e for e in events if 'seq' in e]
-    events_without_seq = [e for e in events if 'seq' not in e]
-
-    if events_with_seq:
-        # Check seq-based ordering
-        events_with_seq.sort(key=lambda x: x.get('seq', 0))
-        prev_seq = None
-        for event in events_with_seq:
-            seq = event.get('seq')
-            if prev_seq is not None and seq <= prev_seq:
-                violations.append(
-                    f"Order violation: seq {seq} after seq {prev_seq} "
-                    f"(eventId: {event.get('eventId')})"
-                )
-            prev_seq = seq
-
-    # Check causedBy-based ordering (DAG)
-    if events_without_seq or events_with_seq:
-        # Build event graph
-        event_by_id = {e.get('eventId'): e for e in events if 'eventId' in e}
-        caused_by_edges = {}
-
-        for event in events:
-            event_id = event.get('eventId')
-            caused_by = event.get('causedBy')
-            if event_id and caused_by:
-                if caused_by not in caused_by_edges:
-                    caused_by_edges[caused_by] = []
-                caused_by_edges[caused_by].append(event_id)
-
-        # Check that all causedBy references point to existing events
-        for event in events:
-            caused_by = event.get('causedBy')
-            if caused_by and caused_by not in event_by_id:
-                violations.append(
-                    f"Missing source event: {caused_by} referenced by {event.get('eventId')}"
-                )
-
-    return len(violations) == 0, violations
-
-
-def check_payload(fixtures: List[Dict[str, Any]], events: List[Dict[str, Any]]) -> Tuple[bool, List[str]]:
-    """
-    Check that event payloads match expected payloads.
-    Returns (passed, mismatches).
-    """
-    mismatches = []
-
-    # Create a map of expected payloads by eventType and seq
-    expected_by_key = {}
-    for fixture in fixtures:
-        event_type = fixture.get('eventType')
-        seq = fixture.get('seq')
-        key = (event_type, seq) if seq is not None else event_type
-        expected_by_key[key] = fixture.get('expectedPayload', {})
-
-    # Check each observed event
-    for event in events:
-        event_type = event.get('eventType')
-        seq = event.get('seq')
-        key = (event_type, seq) if seq is not None else event_type
-
-        if key in expected_by_key:
-            expected_payload = expected_by_key[key]
-            observed_payload = event.get('payload', {})
-
-            # Compare payloads (simple deep equality check)
-            if not payloads_match(expected_payload, observed_payload):
-                mismatches.append(
-                    f"Payload mismatch for {event_type} (seq={seq}): "
-                    f"expected {json.dumps(expected_payload)}, "
-                    f"got {json.dumps(observed_payload)}"
-                )
-
-    return len(mismatches) == 0, mismatches
-
-
-def payloads_match(expected: Dict[str, Any], observed: Dict[str, Any]) -> bool:
-    """Check if payloads match (deep equality)."""
-    # Simple recursive comparison
-    if type(expected) != type(observed):
-        return False
-
-    if isinstance(expected, dict):
-        for key, value in expected.items():
-            if key not in observed:
-                return False
-            if not payloads_match(value, observed[key]):
-                return False
-        return True
-    elif isinstance(expected, list):
-        if len(expected) != len(observed):
-            return False
-        return all(payloads_match(e, o) for e, o in zip(expected, observed))
-    else:
-        return expected == observed
-
-
-def check_idempotency(events: List[Dict[str, Any]]) -> Tuple[bool, List[str]]:
-    """
-    Check for duplicate eventIds.
-    Returns (passed, duplicates).
-    """
-    seen_ids = set()
-    duplicates = []
-
-    for event in events:
-        event_id = event.get('eventId')
-        if event_id:
-            if event_id in seen_ids:
-                duplicates.append(f"Duplicate eventId: {event_id}")
-            seen_ids.add(event_id)
-
-    return len(duplicates) == 0, duplicates
-
-
-def check_latency(
-    metadata: Dict[str, Any],
-    events: List[Dict[str, Any]]
-) -> Tuple[bool, Dict[str, Any]]:
-    """
-    Check that event latencies are within acceptable limits.
-    Returns (passed, metrics).
-    """
-    if not events:
-        return False, {'error': 'No events to check latency'}
-
-    # Parse timestamps
-    try:
-        started_at = datetime.fromisoformat(metadata.get('startedAt', '').replace('Z', '+00:00'))
-    except Exception:
-        started_at = datetime.now(timezone.utc)
-
-    event_times = []
-    for event in events:
-        received_at_str = event.get('receivedAt')
-        if received_at_str:
-            try:
-                received_at = datetime.fromisoformat(received_at_str.replace('Z', '+00:00'))
-                event_times.append(received_at)
-            except Exception:
-                pass
-
-    if not event_times:
-        return False, {'error': 'No valid timestamps in events'}
-
-    # Calculate metrics
-    first_event_time = min(event_times)
-    last_event_time = max(event_times)
-
-    total_duration_ms = int((last_event_time - started_at).total_seconds() * 1000)
-    first_event_latency_ms = int((first_event_time - started_at).total_seconds() * 1000)
-
-    metrics = {
-        'totalDurationMs': total_duration_ms,
-        'firstEventLatencyMs': first_event_latency_ms,
-        'eventCount': len(events),
-    }
-
-    # Check if within limits
-    passed = total_duration_ms <= MAX_LATENCY_MS
-
-    if not passed:
-        metrics['violation'] = f"Total duration {total_duration_ms}ms exceeds limit {MAX_LATENCY_MS}ms"
-
-    return passed, metrics
-
-
-def write_verdict(
-    run_id: str,
-    passed: bool,
-    checks: Dict[str, Tuple[bool, Any]],
-    metrics: Dict[str, Any],
-) -> None:
-    """Write verification verdict to DynamoDB."""
-    table = dynamodb.Table(TABLE_NAME)
-
-    # Compile all failures
-    failures = []
-    for check_name, (check_passed, details) in checks.items():
-        if not check_passed:
-            failures.append({
-                'check': check_name,
-                'details': details,
-            })
-
-    verdict = {
-        'runId': run_id,
-        'sk': 'verdict#1',
-        'status': 'passed' if passed else 'failed',
-        'passed': passed,
-        'checks': {
-            name: {'passed': result[0], 'details': result[1]}
-            for name, result in checks.items()
-        },
-        'failures': failures,
-        'metrics': metrics,
-        'verifiedAt': datetime.now(timezone.utc).isoformat(),
-    }
-
-    table.put_item(Item=verdict)
-
-    # Update run metadata status
-    table.update_item(
-        Key={
-            'runId': run_id,
-            'sk': 'run#meta',
-        },
-        UpdateExpression='SET #status = :status, completedAt = :completedAt',
-        ExpressionAttributeNames={'#status': 'status'},
-        ExpressionAttributeValues={
-            ':status': 'completed',
-            ':completedAt': datetime.now(timezone.utc).isoformat(),
-        },
+def _get_slots_for_run(run_id: str):
+    resp = table.query(
+        KeyConditionExpression=Key("pk").eq(f"run#{run_id}") & Key("sk").begins_with("slot#")
     )
+    return resp.get("Items", [])
 
 
-def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
+# ---------- STATUS MODE ----------
+
+def _status_mode(run_id: str) -> dict:
     """
-    Lambda handler for Verifier.
+    Used by Step Functions "CheckRunStatus":
 
-    Expected event structure:
-    {
-        "runId": "uuid"
+    Returns:
+      {
+        "status": "running|ready|timeout|unknown",
+        "runId": "...",
+        "observedCount": N,
+        "expectedSlots": N
+      }
+    """
+    meta = _get_run_meta(run_id)
+    if not meta:
+        print(f"[Verifier/Status] No run meta found for runId={run_id}")
+        return {"status": "unknown", "runId": run_id}
+
+    expected_slots = int(meta.get("expectedSlots", 0))
+    observed_count = int(meta.get("observedCount", 0))
+    current_status = meta.get("status", "running")
+
+    timeout_at_str = meta.get("timeoutAt")
+    now = datetime.now(timezone.utc)
+
+    # Timeout check
+    if timeout_at_str:
+        timeout_at = _parse_iso(timeout_at_str)
+        if timeout_at and now >= timeout_at:
+            # Mark as timeout (if not already)
+            if current_status != "timeout":
+                try:
+                    table.update_item(
+                        Key={"pk": meta["pk"], "sk": meta["sk"]},
+                        UpdateExpression="SET #s = :timeout",
+                        ExpressionAttributeNames={"#s": "status"},
+                        ExpressionAttributeValues={":timeout": "timeout"},
+                    )
+                except Exception as e:
+                    print(f"[Verifier/Status] Failed to set run status to timeout: {e}")
+            return {
+                "status": "timeout",
+                "runId": run_id,
+                "observedCount": observed_count,
+                "expectedSlots": expected_slots,
+            }
+
+    # If all slots have at least one observed event -> ready
+    if observed_count >= expected_slots and expected_slots > 0:
+        if current_status != "ready":
+            try:
+                table.update_item(
+                    Key={"pk": meta["pk"], "sk": meta["sk"]},
+                    UpdateExpression="SET #s = :ready",
+                    ExpressionAttributeNames={"#s": "status"},
+                    ExpressionAttributeValues={":ready": "ready"},
+                )
+            except Exception as e:
+                print(f"[Verifier/Status] Failed to set run status to ready: {e}")
+        return {
+            "status": "ready",
+            "runId": run_id,
+            "observedCount": observed_count,
+            "expectedSlots": expected_slots,
+        }
+
+    # Otherwise still running
+    return {
+        "status": "running",
+        "runId": run_id,
+        "observedCount": observed_count,
+        "expectedSlots": expected_slots,
     }
+
+
+# ---------- VERIFY MODE ----------
+
+def _verify_slot(run_meta: dict, slot: dict) -> dict:
     """
+    Simple verification:
+
+    - No observedEvents -> "missing"
+    - 1 observed & payloadHash matches (if provided) -> "matched"
+    - >1 observed -> "duplicate"
+    - 1 observed & hash differs -> "mismatch"
+    """
+    expected = slot.get("expected", {}) or {}
+    observed_events = slot.get("observedEvents", []) or []
+
+    status = "pending"
+    reasons = []
+    latency_ms = None
+
+    if not observed_events:
+        status = "missing"
+        reasons.append("No observed events for this slot")
+    else:
+        first_obs = observed_events[0]
+        expected_hash = expected.get("payloadHash")
+        observed_hash = first_obs.get("payloadHash")
+
+        if len(observed_events) > 1:
+            status = "duplicate"
+            reasons.append(f"{len(observed_events)} observed events for this slot")
+        else:
+            if expected_hash and observed_hash and expected_hash != observed_hash:
+                status = "mismatch"
+                reasons.append("Payload hash mismatch")
+            else:
+                status = "matched"
+
+        started_at_str = run_meta.get("startedAt")
+        started_at = _parse_iso(started_at_str) if started_at_str else None
+        received_at_str = first_obs.get("receivedAt")
+        received_at = _parse_iso(received_at_str) if received_at_str else None
+
+        if started_at and received_at:
+            delta = received_at - started_at
+            latency_ms = int(delta.total_seconds() * 1000)
+
+    return {
+        "status": status,
+        "reasons": reasons,
+        "latencyMs": latency_ms,
+        "checkedAt": _now_iso(),
+        "primaryObservedIndex": 0 if observed_events else None,
+    }
+
+
+def _verify_mode(run_id: str) -> dict:
+    meta = _get_run_meta(run_id)
+    if not meta:
+        raise ValueError(f"No run meta found for runId={run_id}")
+
+    slots = _get_slots_for_run(run_id)
+    print(f"[Verifier/Verify] Found {len(slots)} slots for run {run_id}")
+
+    slot_status_counts = Counter()
+    for slot in slots:
+        verdict = _verify_slot(meta, slot)
+        slot_status_counts[verdict["status"]] += 1
+
+        try:
+            table.update_item(
+                Key={"pk": slot["pk"], "sk": slot["sk"]},
+                UpdateExpression="SET verdict = :verdict",
+                ExpressionAttributeValues={":verdict": verdict},
+            )
+        except Exception as e:
+            print(f"[Verifier/Verify] Failed to update verdict for {slot['pk']} / {slot['sk']}: {e}")
+
+    print(f"[Verifier/Verify] Slot verdict counts: {dict(slot_status_counts)}")
+
+    current_status = meta.get("status", "running")
+
+    if current_status == "timeout":
+        run_status = "failed"  # or keep "timeout" if you want to distinguish
+    else:
+        if (
+            slot_status_counts.get("missing")
+            or slot_status_counts.get("mismatch")
+            or slot_status_counts.get("duplicate")
+        ):
+            run_status = "failed"
+        else:
+            run_status = "passed"
+
+    # Update run meta status
     try:
-        run_id = event.get('runId')
-        if not run_id:
-            return {
-                'statusCode': 400,
-                'body': json.dumps({
-                    'error': 'Missing required field: runId',
-                }),
-            }
-
-        # Load run metadata
-        metadata = load_run_metadata(run_id)
-        if not metadata:
-            return {
-                'statusCode': 404,
-                'body': json.dumps({
-                    'error': f'Run {run_id} not found',
-                }),
-            }
-
-        # Load fixtures and observed events
-        fixtures = load_fixtures(run_id)
-        events = load_observed_events(run_id)
-
-        if not fixtures:
-            return {
-                'statusCode': 400,
-                'body': json.dumps({
-                    'error': f'No fixtures found for run {run_id}',
-                }),
-            }
-
-        # Perform all checks
-        presence_passed, presence_details = check_presence(fixtures, events)
-        order_passed, order_details = check_order(fixtures, events)
-        payload_passed, payload_details = check_payload(fixtures, events)
-        idempotency_passed, idempotency_details = check_idempotency(events)
-        latency_passed, latency_metrics = check_latency(metadata, events)
-
-        checks = {
-            'presence': (presence_passed, presence_details),
-            'order': (order_passed, order_details),
-            'payload': (payload_passed, payload_details),
-            'idempotency': (idempotency_passed, idempotency_details),
-            'latency': (latency_passed, latency_metrics),
-        }
-
-        # Overall verdict: all checks must pass
-        passed = all(result[0] for result in checks.values())
-
-        # Write verdict
-        write_verdict(run_id, passed, checks, latency_metrics)
-
-        return {
-            'statusCode': 200,
-            'body': json.dumps({
-                'runId': run_id,
-                'passed': passed,
-                'checks': {
-                    name: {'passed': result[0], 'details': result[1]}
-                    for name, result in checks.items()
-                },
-                'metrics': latency_metrics,
-            }),
-        }
-
+        table.update_item(
+            Key={"pk": meta["pk"], "sk": meta["sk"]},
+            UpdateExpression="SET #s = :status",
+            ExpressionAttributeNames={"#s": "status"},
+            ExpressionAttributeValues={":status": run_status},
+        )
     except Exception as e:
-        print(f'Error in verifier: {str(e)}')
-        import traceback
-        traceback.print_exc()
-        return {
-            'statusCode': 500,
-            'body': json.dumps({
-                'error': str(e),
-            }),
-        }
+        print(f"[Verifier/Verify] Failed to update run meta status: {e}")
+
+    return {
+        "runId": run_id,
+        "runStatus": run_status,
+        "slotStatusCounts": dict(slot_status_counts),
+    }
+
+
+# ---------- HANDLER ----------
+
+def handler(event, context):
+    """
+    Mode selection:
+
+    - Status mode (called by SFN loop):
+      { "runId": "...", "mode": "status" }
+
+    - Verify mode (called by SFN after ready/timeout):
+      { "runId": "...", "mode": "verify" }
+    """
+    print(f"[Verifier] Event: {json.dumps(event)}")
+
+    mode = event.get("mode") or "verify"
+    run_id = event.get("runId")
+
+    # Backwards compatibility: if runId not provided directly, try seedResult
+    if not run_id:
+        seed = event.get("seedResult") or {}
+        run_id = seed.get("runId")
+
+    if not run_id:
+        raise ValueError("runId is required for verifier")
+
+    if mode == "status":
+        return _status_mode(run_id)
+    else:
+        return _verify_mode(run_id)

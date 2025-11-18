@@ -1,6 +1,6 @@
 import { StageName } from '@orcabus/platform-cdk-constructs/shared-config/accounts';
 import { IntegrationTestsStorageStackProps } from './storage-stack';
-import { IntegrationTestsOrchestratorStackProps } from './orchestrator-stack';
+import { IntegrationTestsHarnessStackProps } from './harness-stack';
 import {
   BETA_ENVIRONMENT,
   GAMMA_ENVIRONMENT,
@@ -11,13 +11,13 @@ import {
 } from '@orcabus/platform-cdk-constructs/shared-config/networking';
 import { EVENT_BUS_NAME } from '@orcabus/platform-cdk-constructs/shared-config/event-bridge';
 
-export const getIntegrationTestsOrchestratorStackProps = (
+export const getIntegrationTestsHarnessStackProps = (
   stage: StageName
-): IntegrationTestsOrchestratorStackProps => {
+): IntegrationTestsHarnessStackProps => {
   const accountId = stage === 'BETA' ? BETA_ENVIRONMENT.account : GAMMA_ENVIRONMENT.account;
   const region = stage === 'BETA' ? BETA_ENVIRONMENT.region : GAMMA_ENVIRONMENT.region;
   return {
-    tableName: `orcabus-platform-it-${stage}-store`,
+    dynamoDBTableName: `orcabus-platform-it-${stage}-store`,
     s3BucketName: `orcabus-platform-it-${stage}-${accountId}-${region}`,
     vpcProps: VPC_LOOKUP_PROPS,
     lambdaSecurityGroupName: SHARED_SECURITY_GROUP_NAME,
@@ -33,6 +33,6 @@ export const getIntegrationTestsStorageStackProps = (
   return {
     stage: stage,
     bucketName: `orcabus-platform-it-${stage}-${accountId}-${region}`,
-    tableName: `orcabus-platform-it-${stage}-store`,
+    dynamoDBTableName: `orcabus-platform-it-${stage}-store`,
   };
 };
