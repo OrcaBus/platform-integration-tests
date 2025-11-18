@@ -163,7 +163,7 @@ pnpm cdk-stateful <command>
 
 This CDK project manages multiple stacks. The root stack (the only one that does not include `DeploymentPipeline` in its stack ID) is deployed in the toolchain account and sets up a CodePipeline for cross-environment deployments to `beta`, `gamma`, and `prod`.
 
-To list all available stacks, run:
+To list all available stateless stacks, run:
 
 ```sh
 pnpm cdk-stateless ls
@@ -172,11 +172,25 @@ pnpm cdk-stateless ls
 Example output:
 
 ```sh
-OrcaBusStatelessServiceStack
-OrcaBusStatelessServiceStack/DeploymentPipeline/OrcaBusBeta/DeployStack (OrcaBusBeta-DeployStack)
-OrcaBusStatelessServiceStack/DeploymentPipeline/OrcaBusGamma/DeployStack (OrcaBusGamma-DeployStack)
-OrcaBusStatelessServiceStack/DeploymentPipeline/OrcaBusProd/DeployStack (OrcaBusProd-DeployStack)
+StatelessPlatformItHarnessStack
+StatelessPlatformItHarnessStack/DeploymentPipeline/OrcaBusBeta/StatelessPlatformItHarnessStack (OrcaBusBeta-StatelessPlatformItHarnessStack)
+StatelessPlatformItHarnessStack/DeploymentPipeline/OrcaBusGamma/StatelessPlatformItHarnessStack (OrcaBusGamma-StatelessPlatformItHarnessStack)
 ```
+
+To list all available stateful stacks, run:
+
+```sh
+pnpm cdk-stateful ls
+```
+
+Example output:
+
+```sh
+StatefulPlatformItStorageStack
+StatefulPlatformItStorageStack/DeploymentPipeline/OrcaBusBeta/StatefulPlatformItStorageStack (OrcaBusBeta-StatefulPlatformItStorageStack)
+StatefulPlatformItStorageStack/DeploymentPipeline/OrcaBusGamma/StatefulPlatformItStorageStack (OrcaBusGamma-StatefulPlatformItStorageStack)
+```
+
 
 
 Development
