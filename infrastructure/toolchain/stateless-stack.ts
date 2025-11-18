@@ -12,12 +12,12 @@ export class StatelessStack extends cdk.Stack {
       githubBranch: 'main',
       githubRepo: 'platform-integration-tests',
       stack: IntegrationTestsHarnessStack,
-      stackName: /** TODO: Replace with string. Example: */ 'StatelessMicroserviceManager',
+      stackName: 'StatelessPlatformItHarnessStack',
       stackConfig: {
         beta: getIntegrationTestsHarnessStackProps('BETA'),
         gamma: getIntegrationTestsHarnessStackProps('GAMMA'),
       },
-      pipelineName: /** TODO: Replace with string. Example: */ 'OrcaBus-StatelessMicroservice',
+      pipelineName: 'StatelessPlatformItHarnessPipeline',
       cdkSynthCmd: ['pnpm install --frozen-lockfile --ignore-scripts', 'pnpm cdk-stateless synth'],
     });
   }

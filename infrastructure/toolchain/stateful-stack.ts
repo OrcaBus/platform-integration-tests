@@ -12,12 +12,12 @@ export class StatefulStack extends cdk.Stack {
       githubBranch: 'main',
       githubRepo: 'platform-integration-tests',
       stack: IntegrationTestsStorageStack,
-      stackName: 'StatefulPlatformItService',
+      stackName: 'StatefulPlatformItStorageStack',
       stackConfig: {
         beta: getIntegrationTestsStorageStackProps('BETA'),
         gamma: getIntegrationTestsStorageStackProps('GAMMA'),
       },
-      pipelineName: 'StatefulPlatformItServicePipeline',
+      pipelineName: 'StatefulPlatformItStoragePipeline',
       cdkSynthCmd: ['pnpm install --frozen-lockfile --ignore-scripts', 'pnpm cdk-stateful synth'],
     });
   }
