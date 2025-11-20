@@ -4,7 +4,8 @@ import { Construct } from 'constructs';
 import { PythonFunction, PythonLayerVersion } from '@aws-cdk/aws-lambda-python-alpha';
 import { aws_lambda, Duration, Stack } from 'aws-cdk-lib';
 import { ISecurityGroup, IVpc, SecurityGroup, Vpc, VpcLookupOptions } from 'aws-cdk-lib/aws-ec2';
-import { EventBus, IEventBus } from 'aws-cdk-lib/aws-events';
+import { EventBus, IEventBus, Rule } from 'aws-cdk-lib/aws-events';
+import { LambdaFunction } from 'aws-cdk-lib/aws-events-targets';
 import { Architecture } from 'aws-cdk-lib/aws-lambda';
 import { ITable, Table } from 'aws-cdk-lib/aws-dynamodb';
 import { IBucket, Bucket } from 'aws-cdk-lib/aws-s3';
@@ -20,9 +21,11 @@ import {
   LogLevel,
   JsonPath,
   DefinitionBody,
+  TaskInput,
 } from 'aws-cdk-lib/aws-stepfunctions';
 import { LambdaInvoke } from 'aws-cdk-lib/aws-stepfunctions-tasks';
 import { LogGroup, RetentionDays } from 'aws-cdk-lib/aws-logs';
+import { PolicyStatement } from 'aws-cdk-lib/aws-iam';
 
 export interface IntegrationTestsHarnessStackProps {
   mainBusName: string;
@@ -33,7 +36,7 @@ export interface IntegrationTestsHarnessStackProps {
 }
 export class IntegrationTestsHarnessStack extends Stack {
   private readonly baseLayer: PythonLayerVersion;
-  private readonly lambdaEnv;
+  private readonly lambdaEnv: { [key: string]: string };
   private readonly lambdaRuntimePythonVersion: aws_lambda.Runtime = aws_lambda.Runtime.PYTHON_3_12;
   private readonly vpc: IVpc;
   private readonly lambdaSG: ISecurityGroup;
@@ -88,13 +91,27 @@ export class IntegrationTestsHarnessStack extends Stack {
     this.mainBus.grantPutEventsTo(seeder);
     this.dynamoDBTable.grantReadWriteData(seeder);
     this.s3Bucket.grantRead(seeder);
+
+    // Create disabled collector rule
+    const collectorRule = this.setupCollectorEventRule(collector);
+    // RuleController Lambda
+    const ruleController = this.createRuleControllerFunction(collectorRule);
+
     this.dynamoDBTable.grantReadWriteData(collector);
     this.s3Bucket.grantReadWrite(collector);
     this.dynamoDBTable.grantReadWriteData(verifier);
     this.dynamoDBTable.grantReadData(reporter);
     this.s3Bucket.grantReadWrite(reporter);
 
-    this.createStepFunctionsStateMachine(seeder, collector, verifier, reporter);
+    // Allow RuleController to enable/disable the collector rule
+    ruleController.addToRolePolicy(
+      new PolicyStatement({
+        actions: ['events:EnableRule', 'events:DisableRule'],
+        resources: [collectorRule.ruleArn],
+      })
+    );
+
+    this.createStepFunctionsStateMachine(seeder, collector, verifier, reporter, ruleController);
   }
   private createPythonFunction(name: string, props: object): PythonFunction {
     return new PythonFunction(this, name, {
@@ -125,6 +142,40 @@ export class IntegrationTestsHarnessStack extends Stack {
       timeout: Duration.seconds(300),
     });
   }
+
+  private setupCollectorEventRule(collector: PythonFunction): Rule {
+    return new Rule(this, this.stackName + 'CollectorEventRule', {
+      eventBus: this.mainBus,
+      ruleName: this.stackName + 'CollectorEventRule',
+      description: 'Rule to collect events from the main bus for the integration tests.',
+      eventPattern: {
+        account: [String(Stack.of(this).account)],
+        // @ts-expect-error anything-but is not supported in the type definition
+        source: [{ 'anything-but': 'orcabus.integrationtest' }],
+      },
+      enabled: false,
+      targets: [
+        new LambdaFunction(collector, {
+          maxEventAge: Duration.seconds(60),
+          retryAttempts: 3,
+        }),
+      ],
+    });
+  }
+
+  private createRuleControllerFunction(collectorRule: Rule): PythonFunction {
+    return this.createPythonFunction('RuleController', {
+      index: 'rule_controller.py',
+      handler: 'handler',
+      timeout: Duration.seconds(60),
+      // override base env to add RULE_NAME for this function
+      environment: {
+        ...this.lambdaEnv,
+        RULE_NAME: collectorRule.ruleName,
+      },
+    });
+  }
+
   private createVerifierFunction(): PythonFunction {
     return this.createPythonFunction('Verifier', {
       index: 'verifier.py',
@@ -144,7 +195,8 @@ export class IntegrationTestsHarnessStack extends Stack {
     seeder: PythonFunction,
     collector: PythonFunction,
     verifier: PythonFunction,
-    reporter: PythonFunction
+    reporter: PythonFunction,
+    ruleController: PythonFunction
   ): StateMachine {
     const logGroup = new LogGroup(this, 'IntegrationTestsHarnessStateMachineLogs', {
       retention: RetentionDays.ONE_MONTH,
@@ -152,7 +204,13 @@ export class IntegrationTestsHarnessStack extends Stack {
 
     return new StateMachine(this, 'StepFunctionsStateMachine', {
       definitionBody: DefinitionBody.fromChainable(
-        this.createStepFunctionsControllerFunction(seeder, collector, verifier, reporter)
+        this.createStepFunctionsControllerFunction(
+          seeder,
+          collector,
+          verifier,
+          reporter,
+          ruleController
+        )
       ),
       stateMachineType: StateMachineType.STANDARD,
       stateMachineName: 'PlatformItStepFunctionsStateMachine',
@@ -169,25 +227,29 @@ export class IntegrationTestsHarnessStack extends Stack {
     seeder: PythonFunction,
     collector: PythonFunction,
     verifier: PythonFunction,
-    reporter: PythonFunction
+    reporter: PythonFunction,
+    ruleController: PythonFunction
   ): IChainable {
     // -------------------------
     // Step Functions Definition
     // -------------------------
 
-    // 1. GenerateRunId
-    // For now this Pass just forwards input; runId is expected from caller or Seeder's output.
-    const generateRunId = new Pass(this, 'GenerateRunId', {
-      resultPath: '$',
-    });
-
-    // 2. SeedScenario: Seeder will create run#meta + slot items, and emit seed events.
+    // 1. SeedScenario: Seeder will create testRunId + meta + slot items, and emit seed events.
+    // Seeder is responsible for generating and returning `testRunId`.
     const seedScenarioTask = new LambdaInvoke(this, 'SeedScenario', {
       lambdaFunction: seeder,
       payloadResponseOnly: true,
-      // Seeder returns { runId, scenario, expectedSlots, ... }
+      // Seeder returns { testRunId, scenario, expectedSlots, ... }
       // We store that under $.seedResult
       resultPath: '$.seedResult',
+    });
+
+    // 2. RuleController: Enable/disable the collector rule
+    const enableRuleTask = new LambdaInvoke(this, 'EnableRule', {
+      lambdaFunction: ruleController,
+      payload: TaskInput.fromObject({
+        action: 'enable',
+      }),
     });
 
     // 3. CheckRunStatus: call Verifier in "status" mode
@@ -195,7 +257,7 @@ export class IntegrationTestsHarnessStack extends Stack {
     //   { "runId": <from seedResult>, "mode": "status" }
     const checkRunStatusTask = new LambdaInvoke(this, 'CheckRunStatus', {
       lambdaFunction: verifier,
-      payload: cdk.aws_stepfunctions.TaskInput.fromObject({
+      payload: TaskInput.fromObject({
         runId: JsonPath.stringAt('$.seedResult.runId'),
         mode: 'status',
       }),
@@ -213,7 +275,7 @@ export class IntegrationTestsHarnessStack extends Stack {
     // 5. Verify: call Verifier in "verify" mode once ready/timeout
     const verifyTask = new LambdaInvoke(this, 'VerifyRun', {
       lambdaFunction: verifier,
-      payload: cdk.aws_stepfunctions.TaskInput.fromObject({
+      payload: TaskInput.fromObject({
         runId: JsonPath.stringAt('$.seedResult.runId'),
         mode: 'verify',
       }),
@@ -225,21 +287,36 @@ export class IntegrationTestsHarnessStack extends Stack {
     // 6. Report: Reporter builds HTML, stores in S3
     const reportTask = new LambdaInvoke(this, 'ReportRun', {
       lambdaFunction: reporter,
-      payload: cdk.aws_stepfunctions.TaskInput.fromObject({
-        runId: JsonPath.stringAt('$.seedResult.runId'),
+      payload: TaskInput.fromObject({
+        runId: JsonPath.stringAt('$.seedResult.testRunId'),
         verifyResult: JsonPath.stringAt('$.verifyResult'),
+        // safe if you always document that callers pass serviceName or Seeder sets it in seedResult
+        serviceName: JsonPath.stringAt('$.seedResult.serviceName'),
       }),
       payloadResponseOnly: true,
       resultPath: '$.reportResult',
     });
 
-    // 7. Final state
+    // 7. Disable Collector rule after run finishes
+    const disableCollectorTask = new LambdaInvoke(this, 'DisableCollectorRule', {
+      lambdaFunction: ruleController,
+      payload: TaskInput.fromObject({
+        action: 'disable',
+      }),
+      payloadResponseOnly: true,
+      resultPath: JsonPath.DISCARD,
+    });
+
+    // 8. Final state
     const finalState = new Pass(this, 'Done', {
       resultPath: '$.final',
     });
 
     // verify -> report -> done chain
-    const verifyReportChain = verifyTask.next(reportTask).next(finalState);
+    const verifyReportChain = verifyTask
+      .next(reportTask)
+      .next(disableCollectorTask)
+      .next(finalState);
 
     // Choice based on status.status
     const statusChoice = new Choice(this, 'RunReadyOrTimeout?')
@@ -251,6 +328,6 @@ export class IntegrationTestsHarnessStack extends Stack {
     const waitLoop = waitX.next(checkRunStatusTask).next(statusChoice);
 
     // Main chain
-    return generateRunId.next(seedScenarioTask).next(waitLoop);
+    return enableRuleTask.next(seedScenarioTask).next(waitLoop);
   }
 }

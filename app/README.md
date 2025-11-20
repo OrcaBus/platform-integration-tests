@@ -1,392 +1,628 @@
 # Platform Integration Tests - Application Code
 
-This directory contains the Lambda function implementations for the Platform Integration Testing service. The service validates end-to-end event flows through OrcaBus by seeding test events, collecting observed events, verifying them against expected fixtures, and generating reports.
+This directory contains the Lambda function implementations for the Platform Integration Testing service. The service validates end-to-end event flows through OrcaBus by:
 
-## Overview
+1. **Seeding** synthetic test events into OrcaBus.
+2. **Collecting** all test-mode events emitted by platform services.
+3. **Verifying** those observed events against expected fixtures.
+4. **Reporting** the verdict and storing human-readable reports.
 
-The service consists of four Lambda functions that work together to test event-driven workflows:
+Everything runs as a **serverless test harness**:
 
-1. **Seeder** - Publishes test events to OrcaBus
-2. **Collector** - Archives events from OrcaBus to DynamoDB
-3. **Verifier** - Compares observed events with expected fixtures
-4. **Reporter** - Generates reports and sends notifications
+- Orchestrated by **AWS Step Functions**.
+- Using **EventBridge** (OrcaBus) for events.
+- Using **DynamoDB** for run metadata + expectations.
+- Using **S3** for seed fixtures, archived events, and reports.
+
+---
 
 ## Components
 
-### 1. Test Controller (Step Functions)
+The application code is organised around four Lambda functions:
 
-- Orchestrates one run from **seed → collect → verify → report**
-- States (high-level):
-  1. `GenerateTestId` (Pass or Lambda)
-  2. `InitRunMetadata` (Lambda)
-  3. `SeedScenario` (Seeder Lambda)
-  4. `WaitAndCheckReady` (loop: Wait + CheckRunStatus Lambda)
-  5. `Verify` (Verifier Lambda)
-  6. `Report` (Reporter Lambda)
-  7. `End` (success/fail output to CI)
+1. **Seeder** – loads seed fixtures from S3, writes expectations to DynamoDB, and publishes test events to OrcaBus.
+2. **Collector** – triggered by OrcaBus test events, archives full events to S3 and attaches them to the matching expectations in DynamoDB.
+3. **Verifier** – evaluates whether the observed events satisfy the expectations and writes verdicts to DynamoDB.
+4. **Reporter** – generates an HTML report for a test run and stores it in S3.
 
-> **Implementation**: AWS CDK (TypeScript) defines the entire state machine.
+There is also an **orchestrating Step Functions state machine** defined in CDK that wires these Lambdas together.
 
-### 2. Seeder (Lambda, Python)
+---
 
-**Input:**
+## 1. Test Controller (Step Functions)
 
-- `testId`, `scenario`
+The Step Functions state machine orchestrates one full test run:
 
-**Responsibilities:**
+```text
+EnableCollectorRule (RuleController Lambda)
+  └─> SeedScenario (Seeder)
+       └─> Wait / Status Loop (Verifier in "status" mode)
+            └─> VerifyRun (Verifier in "verify" mode")
+                 └─> ReportRun (Reporter)
+                      └─> DisableCollectorRule
+                           └─> Done
+```
 
-- Load fixtures for `scenario`
-- Write fixtures to DynamoDB under `PK = RUN#<testId>`
-- Set `expected_events` in run metadata
-- Emit initial staging EventBridge event(s) with:
-  - `testMode = true`
-  - `testId = <testId>`
-
-### 3. Collector (Lambda, Python)
-
-**Trigger:**
-
-- EventBridge rule: `detail.testMode = true`
-
-**Responsibilities:**
-
-- Filter events by `testId`
-- Dedupe events (e.g., using a deterministic `eventId`)
-- Save events in DynamoDB under the run partition
-- Increment `received_events` in run metadata
-- Optional: store full payload in S3 if large
-
-**Resilience:**
-
-- Configured with a DLQ (SQS) for failed invocations
-
-### 4. Verifier (Lambda, Python)
-
-**Input:**
-
-- `testId`
-
-**Responsibilities:**
-
-- Load fixtures and observed events for the run
-- Perform checks:
-  - Presence, order, multiplicity, latency, schema (configurable)
-- Write **verdict** item to DynamoDB
-- Update run metadata `status` to `passed` or `failed`
-
-### 5. Reporter (Lambda, Python)
-
-**Input:**
-
-- `testId`
-
-**Responsibilities:**
-
-- Load verdict and metadata from DynamoDB
-- Generate HTML/JSON report and store in S3
-- Update run metadata with `report_s3_key`
-- Optionally send a summary notification (e.g., Slack)
-
-## Test Run Lifecycle
-
-Each test run is identified by a unique `testId`.
-
-### 1. Trigger
-
-- CodePipeline (or another CI job) calls the Step Functions **Test Controller** state machine, passing:
-  - Scenario name (e.g., `stage-test`, `ad-hoc-job`)
-  - Optional configuration (timeouts, strictness level)
-
-### 2. Initialize Run
-
-- The controller:
-  - Generates a new `testId`
-  - Writes an initial **run metadata** record to DynamoDB:
-    - `status = "initializing"`
-    - `scenario`, timestamps, etc.
-
-### 3. Seed Scenario (Seeder Lambda)
-
-- Loads **fixtures** for the selected scenario, e.g., from:
-  - Packaged JSON files, or
-  - S3 under `fixtures/<scenario>.json`
-- Writes fixtures into DynamoDB under the current `testId`
-- Sets `expected_events` in the run metadata (how many orchestration events we expect)
-- Publishes **seed EventBridge event(s)** to the OrcaBus staging bus with:
-  - `detail.testMode = true`
-  - `detail.testId = <testId>`
-- Orchestrated services must **propagate `testId` and `testMode`** when they publish events
-
-### 4. Collect Events (Collector Lambda)
-
-- An **always-on EventBridge rule** forwards events where:
-  - `detail.testMode = true`
-- The Collector Lambda receives these events and:
-  - Filters to the current run `testId`
-  - Stores each event in DynamoDB under the run partition
-  - Increments `received_events` for the run (using DynamoDB atomic counters)
-  - Optionally stores large payloads in S3 and keeps only pointers + key fields in DynamoDB
-
-### 5. Wait for Readiness (Step Functions)
-
-- The controller loops:
-  - `Wait X seconds → CheckRunStatus Lambda`
-- `CheckRunStatus` reads run metadata from DynamoDB and decides:
-  - If `received_events >= expected_events` → mark `status = "ready"`
-  - If total run time exceeds a configured timeout → mark `status = "timed_out"`
-- The controller exits the loop once the run is `ready` **or** `timed_out`
-
-### 6. Verify (Verifier Lambda)
-
-- Verifier loads, for this `testId`:
-  - Fixtures (expected events)
-  - Observed events
-- It performs checks such as:
-  - **Presence**: expected events were emitted
-  - **Order**: events occurred in the right order (if required)
-  - **Multiplicity**: no unexpected duplicates
-  - **Latency windows**: events arrived within configured time thresholds
-  - **Schema and fields**: optional structural checks on the event payload
-- Writes a **verdict record** into DynamoDB:
-  - `status = "passed"` or `"failed"`
-  - List of failed assertions (if any)
-
-### 7. Report (Reporter Lambda)
-
-- Reads verdict + run metadata + key event summaries from DynamoDB
-- Generates:
-  - An **HTML report** (for humans) and/or
-  - A **JSON report** (for machines)
-- Stores them in S3 with a key like: `reports/<date>/<testId>.html`
-- Optionally posts a summary to Slack:
-  - Scenario name, `testId`, verdict, link to report
-- Updates run metadata to include a pointer to the report
-
-### 8. Return Result to CI
-
-- Step Functions ends with a payload including:
-  - `testId`
-  - `scenario`
-  - `verdict`
-  - `reportUrl`
-- CodePipeline uses this output to:
-  - **Allow** promotion to production if `verdict = "passed"`
-  - **Block** or require manual approval if `verdict = "failed"`
-
-## Data Model (DynamoDB)
-
-We use a **single DynamoDB table**, partitioned by **run**, with exactly **two item types**:
-
-1. **Run meta item** – one per test run
-2. **Event slot item** – one per expected event (fixture) in the run
-
-This keeps all data for a run in one partition and makes it easy to query and verify.
-
-### Table Structure
-
-**Table name**: `IntegrationTestRuns` (configurable via CDK)
-
-**Primary key:**
-
-- **Partition key (`pk`)**: `run#<runId>`
-- **Sort key (`sk`)**: `run#meta` or `slot#...`
-
-**Example:**
-
-- `pk = "run#123456"`
-  - `sk = "run#meta"` → run metadata
-  - `sk = "slot#seq#000001"` → first expected event slot
-  - `sk = "slot#seq#000002"` → second expected event slot
-  - ...
-
-All items for a given run share the same `pk`, so a single `Query` gets the entire run.
-
-### Run Meta Item
-
-One item per **test run**. Created by the Seeder at the start of the run.
-
-**Keys:**
-
-- `pk`: `run#<runId>`
-- `sk`: `run#meta`
-
-**Attributes:**
-
-- `runId` (S) - Unique ID for this run (same as the one used as `testId` in events)
-- `scenario` (S) - Human-readable scenario name (e.g., `daily-batch-orchestration`)
-- `expectedSlots` (N) - How many slots/fixtures we expect for this run (number of slot items)
-- `observedCount` (N) - How many slots have **at least one matching observed event**. Incremented by Collector
-- `status` (S) - Run-level state: `running | ready | failed | passed | timeout`
-- `startedAt` (S, ISO8601) - When the run started
-- `timeoutAt` (S, ISO8601, optional) - When the run should be considered timed out
-- `reportS3Key` (S, optional) - S3 key of the generated HTML/JSON report
-- `ttl` (N, optional) - Unix epoch timestamp for automatic expiration (TTL)
-
-**Example:**
+**Execution input (simplified):**
 
 ```jsonc
 {
-  "pk": "run#123456",
-  "sk": "run#meta",
-  "runId": "123456",
-  "scenario": "daily-batch-orchestration",
-  "expectedSlots": 5,
-  "observedCount": 3,
-  "status": "running",
-  "startedAt": "2025-01-01T10:00:00Z",
-  "timeoutAt": "2025-01-01T10:02:00Z",
-  "reportS3Key": null,
-  "ttl": 1735689600
+  "serviceName": "workflowrunmanager"  // or "all" or omitted
 }
 ```
 
-### Event Slot Item
+- `serviceName = "all"` or omitted → seed **all** services scenario.
+- `serviceName = "<service>"` → seed only the fixtures for that service.
 
-One slot per expected event.
+### State machine behaviour
 
-Each slot holds:
+1. **EnableCollectorRule**
+   - A small Lambda that calls `events:EnableRule` for the integration-test collector rule.
+   - The rule routes all `testMode` events from OrcaBus into the **Collector** Lambda.
 
-- The fixture (expected event)
-- A list of observed events that matched this slot
-- A per-slot verdict comparing expected vs observed events
+2. **SeedScenario (Seeder Lambda)**
+   - Calculates a new `testRunId` (e.g. `it-<uuid>`).
+   - Resolves `serviceName` (normalising and falling back to `all` if specific seeds are missing).
+   - Loads seed fixtures from S3 (events + expectations).
+   - Writes:
+     - One **run meta** item (`run#meta`) in DynamoDB.
+     - One **expectation item** per expected event.
+   - Publishes test events to the EventBridge bus (sequentially with a delay between events).
+   - Returns:
 
-**Keys:**
+     ```json
+     {
+       "testRunId": "it-1234",
+       "serviceName": "workflowrunmanager",
+       "expectedSlots": 5,
+       "seededEventsCount": 5,
+       "startedAt": "...",
+       "timeoutAt": "..."
+     }
+     ```
 
-- `pk`: `run#<runId>`
-- `sk`:
-  - Sequential ordering: `slot#seq#000001`, `slot#seq#000002`, ...
-  - DAG-style / logical IDs: `slot#id#INVOICE_CREATED`, `slot#id#BILLING_COMPLETED`, ...
+3. **Wait / Status Loop (Verifier in "status" mode)**
+   - The state machine waits (e.g. 5 seconds), then calls Verifier with:
 
-**Attributes:**
+     ```json
+     { "testRunId": "it-1234", "mode": "status" }
+     ```
 
-- `runId` (S) - Same as in Run meta item (handy for debugging)
-- `slotType` (S):
-  - `seq` – this slot represents a step in a linear sequence
-  - `dag` – this slot represents a node in a DAG (causal graph)
-- `slotId` (S|N):
-  - For `seq`: the sequence number (e.g., 1, 2, 3)
-  - For `dag`: a stable ID for the slot (e.g., "INVOICE_CREATED")
-- `expected` (Map) - Fixture describing the expected event for this slot
+   - Verifier reads the **run meta** item and returns:
 
-**Expected Fields** (typical, but scenario-specific fields can be added):
+     ```json
+     {
+       "status": "running|ready|timeout|unknown",
+       "runId": "it-1234",
+       "observedCount": 3,
+       "expectedSlots": 5
+     }
+     ```
 
-- `detailType` (S) - Expected EventBridge detail-type
-- `source` (S, optional) - Expected EventBridge source
-- `seq` (N, optional) - Position in a linear sequence (slotType = "seq")
-- `causedBy` (L of S, optional) - For DAG flows: IDs of upstream slots/events this one depends on
-- `payloadHash` (S, optional) - Hash of the expected payload/body
-- `observedEvents` (List of Maps) - List of all observed events that were matched to this slot
-- `rawS3Key` (S, optional) - S3 key of the full expected payload (if not stored inline)
+   - Loop continues while `status = "running"`.
+   - Exits the loop when `status = "ready"` (all expectations have at least one observed event) or `status = "timeout"`.
 
-**Observed Event Entry Fields:**
+4. **VerifyRun (Verifier in "verify" mode)**
+   - Called once the run is `ready` or `timeout`:
 
-- `eventId` (S) - A unique ID for the observed event (e.g., EventBridge ID)
-- `detailType` (S) - Observed detail-type
-- `receivedAt` (S, ISO8601) - Time when Collector processed this event
-- `payloadHash` (S, optional) - Hash of the observed payload/body
-- `rawS3Key` (S, optional) - S3 key with the full observed payload, if needed
-- `matchReason` (S, optional) - Free text or enum describing why this event was matched to this slot (e.g., "correlation_id", "seq", "manual_rule")
+     ```json
+     { "testRunId": "it-1234", "mode": "verify" }
+     ```
 
-When no event has matched yet, `observedEvents` is an empty list (`[]`). The Collector appends to this list using `list_append` in DynamoDB.
+   - Verifier loads all **expectation items** and their `observedEvents`, computes verdicts per expectation, and overall run status:
 
-- `verdict` (Map) - Per-slot verdict, aggregated result for this slot, typically set by the Verifier
+     ```json
+     {
+       "runId": "it-1234",
+       "runStatus": "passed|failed",
+       "slotStatusCounts": {
+         "matched": 4,
+         "missing": 1
+       }
+     }
+     ```
 
-**Verdict Fields:**
+5. **ReportRun (Reporter)**
+   - Reporter receives:
 
-- `status` (S) - One of: `pending`, `matched`, `missing`, `mismatch`, `duplicate`, `out_of_order`
-- `reasons` (L of S) - Explanation for non-matched states
-- `latencyMs` (N, optional) - Latency between expected time and the first observed matching event
-- `checkedAt` (S, ISO8601, optional) - When the Verifier last evaluated this slot
-- `primaryObservedIndex` (N, optional) - Index in `observedEvents` considered the primary match (usually 0)
+     ```json
+     {
+       "testRunId": "it-1234",
+       "serviceName": "workflowrunmanager",
+       "verifyResult": { ... }
+     }
+     ```
 
-**Example:**
+   - Generates an HTML report and stores it in S3 at:
 
-```json
+     ```text
+     reports/testruns/{serviceName}/{YYYY}/{MM}/{DD}/{timestamp}-{testRunId}.html
+     ```
+
+   - Returns the S3 location (`bucket`, `key`, `url`) to the state machine.
+
+6. **DisableCollectorRule**
+   - Disables the EventBridge rule again so the collector only runs during active test windows.
+
+7. **Done**
+   - The state machine returns a final payload including `testRunId`, `serviceName`, and the verification + report information.
+
+---
+
+## 2. Seeder (Lambda, Python)
+
+**Input (from Step Functions):**
+
+```jsonc
 {
-  "pk": "run#123456",
-  "sk": "slot#seq#000001",
-  "runId": "123456",
-  "slotType": "seq",
-  "slotId": 1,
-  "expected": {
-    "detailType": "invoice.created",
-    "source": "orchestrator",
-    "seq": 1,
-    "causedBy": [],
-    "payloadHash": "abc123",
-    "rawS3Key": "fixtures/123456/slot-000001.json"
-  },
-  "observedEvents": [
-    {
-      "eventId": "evt-8765",
-      "detailType": "invoice.created",
-      "receivedAt": "2025-01-01T10:00:02Z",
-      "payloadHash": "abc123",
-      "rawS3Key": "events/123456/evt-8765.json",
-      "matchReason": "correlation_id"
-    },
-    {
-      "eventId": "evt-8765-retry",
-      "detailType": "invoice.created",
-      "receivedAt": "2025-01-01T10:00:03Z",
-      "payloadHash": "abc123",
-      "rawS3Key": "events/123456/evt-8765-retry.json",
-      "matchReason": "correlation_id_retry"
-    }
-  ],
-  "verdict": {
-    "status": "matched",
-    "reasons": [],
-    "latencyMs": 2000,
-    "checkedAt": "2025-01-01T10:00:05Z",
-    "primaryObservedIndex": 0
+  "serviceName": "workflowrunmanager"  // optional, default "all"
+}
+```
+
+**Responsibilities:**
+
+- Generate a unique `testRunId` (e.g. `it-<uuid>`).
+- Resolve `serviceName` (if service-specific fixtures don’t exist, fall back to `"all"`).
+- Load seed fixtures from S3 (see [S3 Layout](#s3-layout)).
+- Create a **run meta item** in DynamoDB for `testRunId`.
+- Create one **expectation item** per expected event for this run.
+- Publish test events to EventBridge sequentially with a delay (simulating real service behaviour).
+
+Each event published by Seeder includes in its `detail`:
+
+```jsonc
+{
+  "testRunId": "<testRunId>",
+  "serviceName": "<effectiveServiceName>",
+  "testMode": true,
+  // ... scenario-specific fields
+}
+```
+
+This allows Collector to filter events belonging to a specific test run.
+
+---
+
+## 3. Collector (Lambda, Python)
+
+**Trigger:**
+
+- EventBridge rule on the OrcaBus staging bus (enabled/disabled by the controller).
+- The rule typically filters on `detail.testMode = true`.
+
+**Responsibilities:**
+
+For each EventBridge event:
+
+```jsonc
+{
+  "id": "...",
+  "source": "...",
+  "detail-type": "SomeDetailType",
+  "detail": {
+    "testMode": true,
+    "testRunId": "it-1234",
+    "serviceName": "workflowrunmanager",
+    "...": "..."
   }
 }
 ```
 
-### Seeder & Collector with this Data Model
+The collector:
 
-**Seeder:**
+1. **Filters test events**
+   - Ignores events without `detail.testRunId`.
+   - Ignores events where `detail.testMode != true`.
 
-- Creates:
-  - 1 × Run meta item (`sk = run#meta`)
-  - N × slot items (`sk = slot#...`) with:
-    - `expected` filled
-    - `observedEvents = []`
-    - `verdict.status = "pending"`
-- Emits seed events with `testMode = true` and `testId = runId`
+2. **Ensures run exists**
+   - Loads `run#meta` from DynamoDB for this `testRunId`.
+   - If not found, the event is ignored (e.g. stray or late event).
 
-**Collector:**
+3. **Archives full event to S3**
+   - Stores the entire EventBridge event to:
 
-- Triggered by EventBridge for all test-mode events (`detail.testMode = true`)
-- Resolves the correct slot
-- Appends one entry to `observedEvents` array of that slot
-- If this is the first observed event for that slot, increments `observedCount` on the Run meta item
+     ```text
+     events/testruns/{testRunId}/{YYYY}/{MM}/{DD}/{timestamp}-{eventId}.json
+     ```
 
+4. **Attaches observed event to an expectation**
+   - Queries all expectation items for this run:
+     - `pk = run#{testRunId}`
+     - `sk begins_with "expectation#"`
+   - Naively picks an expectation whose `expected.detailType` matches the event’s `detail-type`:
+     - Prefer an expectation with no `observedEvents` yet.
+     - Otherwise, pick the first matching one.
+   - Appends a new entry to `observedEvents` on that expectation, including:
+     - `eventId`
+     - `detailType`
+     - `receivedAt`
+     - `payloadHash`
+     - `rawS3Key` (where the full event is stored in S3)
+     - `matchReason` (e.g. `"detailType"`)
 
-## Dependencies
+5. **Increments run-level `observedCount`**
+   - If this is the **first observed event** for an expectation, increments `observedCount` on the `run#meta` item.
+   - This allows Verifier (status mode) to treat the run as **ready** once `observedCount >= expectedSlots`.
 
-Install Python dependencies:
+---
+
+## 4. Verifier (Lambda, Python)
+
+Verifier runs in two modes: **status** and **verify**.
+
+### Status Mode
+
+**Input:**
+
+```jsonc
+{ "testRunId": "it-1234", "mode": "status" }
+```
+
+**Responsibilities:**
+
+- Load the **run meta item**:
+
+  ```jsonc
+  {
+    "pk": "run#it-1234",
+    "sk": "run#meta",
+    "runId": "it-1234",
+    "serviceName": "workflowrunmanager",
+    "expectedSlots": 5,
+    "observedCount": 3,
+    "status": "running",
+    "startedAt": "...",
+    "timeoutAt": "..."
+  }
+  ```
+
+- Decide:
+
+  - If now >= `timeoutAt` → mark status `timeout` and return `"timeout"`.
+  - Else if `observedCount >= expectedSlots` → mark status `ready`.
+  - Else → status stays `running`.
+
+- Output:
+
+  ```jsonc
+  {
+    "status": "running|ready|timeout|unknown",
+    "runId": "it-1234",
+    "observedCount": 3,
+    "expectedSlots": 5
+  }
+  ```
+
+The Step Functions loop uses this to decide when to move on to full verification.
+
+### Verify Mode
+
+**Input:**
+
+```jsonc
+{ "testRunId": "it-1234", "mode": "verify" }
+```
+
+**Responsibilities:**
+
+- Load `run#meta`.
+- Load all **expectation items** for this run.
+
+- For each expectation:
+  - No `observedEvents` → `status = "missing"`.
+  - Exactly 1 `observedEvents`:
+    - If both expected and observed have `payloadHash` and they differ → `status = "mismatch"`.
+    - Else → `status = "matched"`.
+  - More than 1 `observedEvents` → `status = "duplicate"`.
+  - Optional: compute `latencyMs` between `run.meta.startedAt` and the first `receivedAt`.
+
+- Writes **per-expectation verdict**:
+
+  ```jsonc
+  "verdict": {
+    "status": "matched|missing|mismatch|duplicate|pending",
+    "reasons": ["..."],
+    "latencyMs": 1234,
+    "checkedAt": "2025-11-21T10:10:00Z",
+    "primaryObservedIndex": 0
+  }
+  ```
+
+- Aggregates an **overall run status**:
+  - If any expectation is `missing`, `mismatch`, or `duplicate` → `runStatus = "failed"`.
+  - If run meta status is `timeout` → `runStatus = "failed"` (or keep `"timeout"` if you prefer).
+  - Otherwise → `runStatus = "passed"`.
+
+- Writes run-level status onto `run#meta` and returns:
+
+  ```jsonc
+  {
+    "runId": "it-1234",
+    "runStatus": "passed|failed",
+    "slotStatusCounts": {
+      "matched": 5,
+      "missing": 0,
+      "mismatch": 0,
+      "duplicate": 0
+    }
+  }
+  ```
+
+---
+
+## 5. Reporter (Lambda, Python)
+
+**Input (from Step Functions):**
+
+```jsonc
+{
+  "testRunId": "it-1234",
+  "serviceName": "workflowrunmanager",
+  "verifyResult": {
+    "runId": "it-1234",
+    "runStatus": "passed",
+    "slotStatusCounts": { "matched": 5 }
+  }
+}
+```
+
+**Responsibilities:**
+
+- Generate an HTML report using a simple template (or Jinja2, via the deps layer).
+- Store the report in S3 with a **timestamp-first filename**:
+
+  ```text
+  reports/testruns/{serviceName}/{YYYY}/{MM}/{DD}/{timestamp}-{testRunId}.html
+  ```
+
+  Example:
+
+  ```text
+  reports/testruns/workflowrunmanager/2025/11/21/
+    2025-11-21T10-15-32Z-it-1234.html
+  ```
+
+- Optionally update `run#meta` with `reportS3Key` (if desired).
+- Return the S3 location to the state machine:
+
+  ```jsonc
+  {
+    "bucket": "<S3_BUCKET>",
+    "key": "reports/testruns/workflowrunmanager/2025/11/21/2025-11-21T10-15-32Z-it-1234.html",
+    "url": "s3://<S3_BUCKET>/reports/testruns/workflowrunmanager/2025/11/21/2025-11-21T10-15-32Z-it-1234.html"
+  }
+  ```
+
+---
+
+## 6. S3 Layout
+
+All fixtures, archived events, and reports live in a single S3 bucket (one per environment/account). The layout is:
+
+```text
+s3://<bucket>/
+  seed/
+    services/
+      all/
+        events.json             # JSON array of seed events for the "all" scenario
+        expectations.json       # JSON array of expectations for "all"
+      workflowrunmanager/
+        events.json             # JSON array of seed events for this service
+        expectations.json       # JSON array of expectations for this service
+      <other-service>/
+        events.json
+        expectations.json
+
+  events/
+    testruns/
+      it-1234/
+        2025/
+          11/
+            21/
+              2025-11-21T10-00-00Z-<event-id-1>.json
+              2025-11-21T10-00-10Z-<event-id-2>.json
+      it-5678/
+        ...
+
+  reports/
+    templates/
+      base.html                 # Main HTML template (used by Reporter)
+      per_service.html          # Optional service-specific template(s)
+
+    testruns/
+      all/
+        2025/11/21/2025-11-21T09-30-00Z-it-0001.html
+      workflowrunmanager/
+        2025/11/21/2025-11-21T10-15-32Z-it-1234.html
+      <other-service>/
+        ...
+```
+
+**Seed files format (example):**
+
+```jsonc
+// seed/services/workflowrunmanager/events.json
+[
+  {
+    "Source": "orca.integrationtest",
+    "DetailType": "WorkflowRunCreated",
+    "Detail": {
+      "workflowId": "wf-123",
+      "status": "created"
+    }
+  },
+  {
+    "Source": "orca.integrationtest",
+    "DetailType": "WorkflowRunUpdated",
+    "Detail": {
+      "workflowId": "wf-123",
+      "status": "running"
+    }
+  }
+]
+```
+
+```jsonc
+// seed/services/workflowrunmanager/expectations.json
+[
+  {
+    "id": "001",
+    "detailType": "WorkflowRunCreated",
+    "payloadHash": "abc123",      // optional, used by verifier if present
+    "...": "..."
+  },
+  {
+    "id": "002",
+    "detailType": "WorkflowRunUpdated"
+  }
+]
+```
+
+---
+
+## 7. DynamoDB Data Model
+
+We use a **single DynamoDB table** for everything (configured via `TABLE_NAME` environment variable). All data for a test run is kept in a **single partition**, keyed by `run#<testRunId>`.
+
+### Primary Key
+
+- **Partition key (`pk`)**: `run#<testRunId>`
+- **Sort key (`sk`)**:
+  - `run#meta` for the run metadata item.
+  - `expectation#<id>` for each expectation.
+
+### Example Partition for One Run
+
+```text
+pk = "run#it-1234"
+│
+├─ sk = "run#meta"
+│    {
+│      "pk": "run#it-1234",
+│      "sk": "run#meta",
+│      "runId": "it-1234",
+│      "serviceName": "workflowrunmanager",
+│      "expectedSlots": 2,
+│      "observedCount": 2,
+│      "status": "passed",
+│      "startedAt": "2025-11-21T10:00:00Z",
+│      "timeoutAt": "2025-11-21T10:15:00Z",
+│      "reportS3Key": "reports/testruns/workflowrunmanager/2025/11/21/2025-11-21T10-15-32Z-it-1234.html"
+│    }
+│
+├─ sk = "expectation#001"
+│    {
+│      "pk": "run#it-1234",
+│      "sk": "expectation#001",
+│      "testRunId": "it-1234",
+│      "serviceName": "workflowrunmanager",
+│      "expected": {
+│        "detailType": "WorkflowRunCreated",
+│        "payloadHash": "abc123"
+│      },
+│      "observedEvents": [
+│        {
+│          "eventId": "evt-1",
+│          "detailType": "WorkflowRunCreated",
+│          "receivedAt": "2025-11-21T10:00:05Z",
+│          "payloadHash": "abc123",
+│          "rawS3Key": "events/testruns/it-1234/2025/11/21/2025-11-21T10-00-05Z-evt-1.json",
+│          "matchReason": "detailType"
+│        }
+│      ],
+│      "verdict": {
+│        "status": "matched",
+│        "reasons": [],
+│        "latencyMs": 5000,
+│        "checkedAt": "2025-11-21T10:10:00Z",
+│        "primaryObservedIndex": 0
+│      }
+│    }
+│
+└─ sk = "expectation#002"
+     {
+       "pk": "run#it-1234",
+       "sk": "expectation#002",
+       "testRunId": "it-1234",
+       "serviceName": "workflowrunmanager",
+       "expected": {
+         "detailType": "WorkflowRunUpdated"
+       },
+       "observedEvents": [
+         {
+           "eventId": "evt-2",
+           "detailType": "WorkflowRunUpdated",
+           "receivedAt": "2025-11-21T10:00:15Z",
+           "payloadHash": "def456",
+           "rawS3Key": "events/testruns/it-1234/2025/11/21/2025-11-21T10-00-15Z-evt-2.json",
+           "matchReason": "detailType"
+         }
+       ],
+       "verdict": {
+         "status": "matched",
+         "reasons": [],
+         "latencyMs": 15000,
+         "checkedAt": "2025-11-21T10:10:00Z",
+         "primaryObservedIndex": 0
+       }
+     }
+```
+
+### Run Meta Item (Summary)
+
+| Attribute       | Type | Description                                                  |
+|----------------|------|--------------------------------------------------------------|
+| `pk`           | S    | `run#<testRunId>`                                            |
+| `sk`           | S    | `run#meta`                                                   |
+| `runId`        | S    | Same as `<testRunId>`                                       |
+| `serviceName`  | S    | Effective service scenario used (`all`, `workflowrunmanager`, etc.) |
+| `expectedSlots`| N    | Number of expectation items for this run                     |
+| `observedCount`| N    | Number of expectations with at least one observed event      |
+| `status`       | S    | `running`, `ready`, `timeout`, `passed`, or `failed`         |
+| `startedAt`    | S    | ISO timestamp when Seeder started the run                    |
+| `timeoutAt`    | S    | ISO timestamp after which the run is considered timed-out    |
+| `reportS3Key`  | S    | (optional) S3 key of the HTML report                         |
+| `ttl`          | N    | (optional) epoch seconds for automatic expiration            |
+
+### Expectation Item
+
+| Attribute          | Type | Description                                                 |
+|--------------------|------|-------------------------------------------------------------|
+| `pk`               | S    | `run#<testRunId>`                                           |
+| `sk`               | S    | `expectation#<id>`                                          |
+| `testRunId`        | S    | The associated run ID                                       |
+| `serviceName`      | S    | Service scenario                                            |
+| `expected`         | M    | Fixture definition (e.g. `detailType`, `payloadHash`)      |
+| `observedEvents`   | L    | List of observed event summaries (from Collector)          |
+| `verdict`          | M    | Per-expectation verdict (from Verifier)                    |
+
+---
+
+## 8. Dependencies
+
+Install Python Lambda dependencies from `deps/requirements.txt`:
 
 ```bash
 pip install -r deps/requirements.txt
 ```
 
-**Required packages:**
+Typical packages:
 
-- `boto3>=1.34.0` - AWS SDK for Python
-- `requests>=2.31.0` - HTTP client library for Slack notifications
+- `boto3>=1.34.0` – AWS SDK for Python
+- `requests>=2.31.0` – HTTP client library (e.g. for Slack notifications)
 
-## Testing
+---
+
+## 9. Local Testing
 
 For local development and testing of Lambda functions:
 
 ```bash
-# Run unit tests (if available)
+# Run unit tests (if present)
 make test
 
 # Install dependencies
 pip install -r deps/requirements.txt
 ```
 
-See the main [README.md](../README.md) for integration testing instructions and deployment procedures.
+For integration testing, see the main repository [README.md](../README.md) for design diagram, deployment and end-to-end execution instructions.

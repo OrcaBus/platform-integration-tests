@@ -3,15 +3,26 @@
 """
 Verifier Lambda Function
 
-When a run is ready (expected count reached or timeout), loads fixtures and
-observed events from DynamoDB and checks:
-- Presence: all expected event types/counts observed
-- Order: strictly increasing seq or all causedBy edges satisfied
-- Payload: each event detail validates against expected event details
-- Idempotency: no duplicate eventId for the run
-- Latency: each step and overall duration within configured windows
+Two modes:
 
-Writes the verdict to DynamoDB.
+Status mode (called repeatedly by Step Functions):
+  - Input: { "runId": "...", "mode": "status" } or { "testRunId": "...", "mode": "status" }
+  - Checks run meta and returns:
+      {
+        "status": "running|ready|timeout|unknown",
+        "runId": "...",
+        "observedCount": N,
+        "expectedSlots": N
+      }
+
+Verify mode (called once when ready/timeout):
+  - Input: { "runId": "...", "mode": "verify" } or { "testRunId": "...", "mode": "verify" }
+  - Loads run meta + expectation items from DynamoDB and checks:
+      - Presence: expectations with no observedEvents -> "missing"
+      - Duplicates: >1 observedEvents -> "duplicate"
+      - Payload hash match/mismatch
+      - Latency: from run.meta.startedAt to first observed receivedAt
+  - Writes verdict per expectation item and updates run meta status to passed/failed.
 """
 
 import json
@@ -41,15 +52,21 @@ def _parse_iso(dt_str: str):
         return None
 
 
-def _get_run_meta(run_id: str):
-    resp = table.get_item(Key={"pk": f"run#{run_id}", "sk": "run#meta"})
+def _get_run_meta(test_run_id: str):
+    resp = table.get_item(Key={"pk": f"run#{test_run_id}", "sk": "run#meta"})
     return resp.get("Item")
 
 
-def _get_slots_for_run(run_id: str):
+def _get_expectations_for_run(test_run_id: str):
+    """
+    Fetch all expectation items for this run:
+
+      pk = run#{testRunId}
+      sk begins_with expectation#
+    """
     resp = table.query(
-        KeyConditionExpression=Key("pk").eq(f"run#{run_id}")
-        & Key("sk").begins_with("slot#")
+        KeyConditionExpression=Key("pk").eq(f"run#{test_run_id}")
+        & Key("sk").begins_with("expectation#")
     )
     return resp.get("Items", [])
 
@@ -57,9 +74,9 @@ def _get_slots_for_run(run_id: str):
 # ---------- STATUS MODE ----------
 
 
-def _status_mode(run_id: str) -> dict:
+def _status_mode(test_run_id: str) -> dict:
     """
-    Used by Step Functions "CheckRunStatus":
+    Used by Step Functions "CheckRunStatus".
 
     Returns:
       {
@@ -69,10 +86,10 @@ def _status_mode(run_id: str) -> dict:
         "expectedSlots": N
       }
     """
-    meta = _get_run_meta(run_id)
+    meta = _get_run_meta(test_run_id)
     if not meta:
-        print(f"[Verifier/Status] No run meta found for runId={run_id}")
-        return {"status": "unknown", "runId": run_id}
+        print(f"[Verifier/Status] No run meta found for testRunId={test_run_id}")
+        return {"status": "unknown", "runId": test_run_id}
 
     expected_slots = int(meta.get("expectedSlots", 0))
     observed_count = int(meta.get("observedCount", 0))
@@ -98,12 +115,12 @@ def _status_mode(run_id: str) -> dict:
                     print(f"[Verifier/Status] Failed to set run status to timeout: {e}")
             return {
                 "status": "timeout",
-                "runId": run_id,
+                "runId": test_run_id,
                 "observedCount": observed_count,
                 "expectedSlots": expected_slots,
             }
 
-    # If all slots have at least one observed event -> ready
+    # If all expectations have at least one observed event -> ready
     if observed_count >= expected_slots and expected_slots > 0:
         if current_status != "ready":
             try:
@@ -117,7 +134,7 @@ def _status_mode(run_id: str) -> dict:
                 print(f"[Verifier/Status] Failed to set run status to ready: {e}")
         return {
             "status": "ready",
-            "runId": run_id,
+            "runId": test_run_id,
             "observedCount": observed_count,
             "expectedSlots": expected_slots,
         }
@@ -125,7 +142,7 @@ def _status_mode(run_id: str) -> dict:
     # Otherwise still running
     return {
         "status": "running",
-        "runId": run_id,
+        "runId": test_run_id,
         "observedCount": observed_count,
         "expectedSlots": expected_slots,
     }
@@ -134,17 +151,17 @@ def _status_mode(run_id: str) -> dict:
 # ---------- VERIFY MODE ----------
 
 
-def _verify_slot(run_meta: dict, slot: dict) -> dict:
+def _verify_expectation(run_meta: dict, expectation_item: dict) -> dict:
     """
-    Simple verification:
+    Simple verification per expectation:
 
     - No observedEvents -> "missing"
     - 1 observed & payloadHash matches (if provided) -> "matched"
     - >1 observed -> "duplicate"
     - 1 observed & hash differs -> "mismatch"
     """
-    expected = slot.get("expected", {}) or {}
-    observed_events = slot.get("observedEvents", []) or []
+    expected = expectation_item.get("expected", {}) or {}
+    observed_events = expectation_item.get("observedEvents", []) or []
 
     status = "pending"
     reasons = []
@@ -152,7 +169,7 @@ def _verify_slot(run_meta: dict, slot: dict) -> dict:
 
     if not observed_events:
         status = "missing"
-        reasons.append("No observed events for this slot")
+        reasons.append("No observed events for this expectation")
     else:
         first_obs = observed_events[0]
         expected_hash = expected.get("payloadHash")
@@ -160,7 +177,9 @@ def _verify_slot(run_meta: dict, slot: dict) -> dict:
 
         if len(observed_events) > 1:
             status = "duplicate"
-            reasons.append(f"{len(observed_events)} observed events for this slot")
+            reasons.append(
+                f"{len(observed_events)} observed events for this expectation"
+            )
         else:
             if expected_hash and observed_hash and expected_hash != observed_hash:
                 status = "mismatch"
@@ -186,31 +205,33 @@ def _verify_slot(run_meta: dict, slot: dict) -> dict:
     }
 
 
-def _verify_mode(run_id: str) -> dict:
-    meta = _get_run_meta(run_id)
+def _verify_mode(test_run_id: str) -> dict:
+    meta = _get_run_meta(test_run_id)
     if not meta:
-        raise ValueError(f"No run meta found for runId={run_id}")
+        raise ValueError(f"No run meta found for testRunId={test_run_id}")
 
-    slots = _get_slots_for_run(run_id)
-    print(f"[Verifier/Verify] Found {len(slots)} slots for run {run_id}")
+    expectations = _get_expectations_for_run(test_run_id)
+    print(
+        f"[Verifier/Verify] Found {len(expectations)} expectations for run {test_run_id}"
+    )
 
-    slot_status_counts = Counter()
-    for slot in slots:
-        verdict = _verify_slot(meta, slot)
-        slot_status_counts[verdict["status"]] += 1
+    status_counts = Counter()
+    for exp_item in expectations:
+        verdict = _verify_expectation(meta, exp_item)
+        status_counts[verdict["status"]] += 1
 
         try:
             table.update_item(
-                Key={"pk": slot["pk"], "sk": slot["sk"]},
+                Key={"pk": exp_item["pk"], "sk": exp_item["sk"]},
                 UpdateExpression="SET verdict = :verdict",
                 ExpressionAttributeValues={":verdict": verdict},
             )
         except Exception as e:
             print(
-                f"[Verifier/Verify] Failed to update verdict for {slot['pk']} / {slot['sk']}: {e}"
+                f"[Verifier/Verify] Failed to update verdict for {exp_item['pk']} / {exp_item['sk']}: {e}"
             )
 
-    print(f"[Verifier/Verify] Slot verdict counts: {dict(slot_status_counts)}")
+    print(f"[Verifier/Verify] Expectation verdict counts: {dict(status_counts)}")
 
     current_status = meta.get("status", "running")
 
@@ -218,9 +239,9 @@ def _verify_mode(run_id: str) -> dict:
         run_status = "failed"  # or keep "timeout" if you want to distinguish
     else:
         if (
-            slot_status_counts.get("missing")
-            or slot_status_counts.get("mismatch")
-            or slot_status_counts.get("duplicate")
+            status_counts.get("missing")
+            or status_counts.get("mismatch")
+            or status_counts.get("duplicate")
         ):
             run_status = "failed"
         else:
@@ -238,9 +259,9 @@ def _verify_mode(run_id: str) -> dict:
         print(f"[Verifier/Verify] Failed to update run meta status: {e}")
 
     return {
-        "runId": run_id,
+        "runId": test_run_id,
         "runStatus": run_status,
-        "slotStatusCounts": dict(slot_status_counts),
+        "slotStatusCounts": dict(status_counts),
     }
 
 
@@ -253,24 +274,29 @@ def handler(event, context):
 
     - Status mode (called by SFN loop):
       { "runId": "...", "mode": "status" }
+      or
+      { "testRunId": "...", "mode": "status" }
 
     - Verify mode (called by SFN after ready/timeout):
       { "runId": "...", "mode": "verify" }
+      or
+      { "testRunId": "...", "mode": "verify" }
     """
     print(f"[Verifier] Event: {json.dumps(event)}")
 
     mode = event.get("mode") or "verify"
-    run_id = event.get("runId")
 
-    # Backwards compatibility: if runId not provided directly, try seedResult
-    if not run_id:
-        seed = event.get("seedResult") or {}
-        run_id = seed.get("runId")
+    test_run_id = (
+        event.get("runId")
+        or event.get("testRunId")
+        or (event.get("seedResult") or {}).get("runId")
+        or (event.get("seedResult") or {}).get("testRunId")
+    )
 
-    if not run_id:
-        raise ValueError("runId is required for verifier")
+    if not test_run_id:
+        raise ValueError("runId or testRunId is required for verifier")
 
     if mode == "status":
-        return _status_mode(run_id)
+        return _status_mode(test_run_id)
     else:
-        return _verify_mode(run_id)
+        return _verify_mode(test_run_id)
