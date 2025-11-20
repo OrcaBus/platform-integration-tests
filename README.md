@@ -178,7 +178,7 @@ StatelessPlatformItHarnessStack/DeploymentPipeline/OrcaBusGamma/StatelessPlatfor
 
 To build the CICD pipeline for Integration Testing stateless service
 ```sh
-pnpm cdk deploy -e StatelessPlatformItHarnessStack
+pnpm cdk-stateless deploy -e StatelessPlatformItHarnessStack
 ```
 
 To build (test) in the dev account
@@ -204,7 +204,7 @@ StatefulPlatformItStorageStack/DeploymentPipeline/OrcaBusGamma/StatefulPlatformI
 
 To build the CICD pipeline for Integration Testing stateful service
 ```sh
-pnpm ccdk-stateful deploy -e StatefulPlatformItStorageStack
+pnpm cdk-stateful deploy -e StatefulPlatformItStorageStack
 ```
 
 To build (test) in the dev account
