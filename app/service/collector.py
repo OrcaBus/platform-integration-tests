@@ -164,7 +164,11 @@ def handler(event, context):
         print(
             f"[Collector] testMode is not true for testRunId={test_run_id}, ignoring."
         )
-        return {"ignored": True, "reason": "testMode_not_true", "testRunId": test_run_id}
+        return {
+            "ignored": True,
+            "reason": "testMode_not_true",
+            "testRunId": test_run_id,
+        }
 
     run_meta = _get_run_meta(test_run_id)
     if not run_meta:

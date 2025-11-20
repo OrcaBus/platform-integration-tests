@@ -30,6 +30,7 @@ s3_client = boto3.client("s3")
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
+
 def _now_iso() -> str:
     return (
         datetime.now(tz=datetime.timezone.utc)
@@ -62,6 +63,7 @@ def _s3_keys_for_service(service_name: str) -> Tuple[str, str]:
         base_prefix + "expectations.json",
     )
 
+
 def _load_s3_json_list(bucket: str, key: str) -> List[Dict[str, Any]]:
     """
     Load JSON from S3 and ensure it's a list.
@@ -79,7 +81,9 @@ def _load_s3_json_list(bucket: str, key: str) -> List[Dict[str, Any]]:
         raise ValueError(f"Seed file {key} must contain a JSON array")
 
 
-def _load_service_seed_definitions(service_name: str) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], str]:
+def _load_service_seed_definitions(
+    service_name: str,
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], str]:
     """
     Try to load events/expectations for the requested serviceName.
     If those keys don't exist, fall back to 'all'.
@@ -177,6 +181,7 @@ def _publish_test_events(
     )
     return published_count
 
+
 def _write_expectations(
     test_run_id: str,
     service_name: str,
@@ -247,15 +252,23 @@ def handler(event, context):
     )
 
     try:
-        events_defs, expectation_defs, effective_service_name = _load_service_seed_definitions(
-            requested_service_name
+        events_defs, expectation_defs, effective_service_name = (
+            _load_service_seed_definitions(requested_service_name)
         )
     except ClientError as e:
-        logger.error("Error loading seed definitions for serviceName=%s: %s", requested_service_name, e)
+        logger.error(
+            "Error loading seed definitions for serviceName=%s: %s",
+            requested_service_name,
+            e,
+        )
         raise
 
-    published_count = _publish_test_events(test_run_id, effective_service_name, events_defs)
-    expectations_count = _write_expectations(test_run_id, effective_service_name, expectation_defs)
+    published_count = _publish_test_events(
+        test_run_id, effective_service_name, events_defs
+    )
+    expectations_count = _write_expectations(
+        test_run_id, effective_service_name, expectation_defs
+    )
 
     now = datetime.now(tz=datetime.timezone.utc)
     started_at = _now_iso()

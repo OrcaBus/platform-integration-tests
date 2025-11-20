@@ -176,6 +176,18 @@ StatelessPlatformItHarnessStack/DeploymentPipeline/OrcaBusBeta/StatelessPlatform
 StatelessPlatformItHarnessStack/DeploymentPipeline/OrcaBusGamma/StatelessPlatformItHarnessStack (OrcaBusGamma-StatelessPlatformItHarnessStack)
 ```
 
+To build the CICD pipeline for Integration Testing stateless service
+```sh
+pnpm cdk deploy -e StatelessPlatformItHarnessStack
+```
+
+To build (test) in the dev account
+```sh
+pnpm cdk synth -e StatelessPlatformItHarnessStack/DeploymentPipeline/OrcaBusBeta/StatelessPlatformItHarnessStack
+pnpm cdk diff -e StatelessPlatformItHarnessStack/DeploymentPipeline/OrcaBusBeta/StatelessPlatformItHarnessStack
+pnpm cdk deploy -e StatelessPlatformItHarnessStack/DeploymentPipeline/OrcaBusBeta/StatelessPlatformItHarnessStack
+```
+
 To list all available stateful stacks, run:
 
 ```sh
@@ -190,7 +202,17 @@ StatefulPlatformItStorageStack/DeploymentPipeline/OrcaBusBeta/StatefulPlatformIt
 StatefulPlatformItStorageStack/DeploymentPipeline/OrcaBusGamma/StatefulPlatformItStorageStack (OrcaBusGamma-StatefulPlatformItStorageStack)
 ```
 
+To build the CICD pipeline for Integration Testing stateful service
+```sh
+pnpm ccdk-stateful deploy -e StatefulPlatformItStorageStack
+```
 
+To build (test) in the dev account
+```sh
+pnpm cdk-stateful synth -e StatefulPlatformItStorageStack/DeploymentPipeline/OrcaBusBeta/StatefulPlatformItStorageStack
+pnpm cdk-stateful diff -e StatefulPlatformItStorageStack/DeploymentPipeline/OrcaBusBeta/StatefulPlatformItStorageStack
+pnpm cdk-stateful deploy -e StatefulPlatformItStorageStack/DeploymentPipeline/OrcaBusBeta/StatefulPlatformItStorageStack
+```
 
 Development
 --------------------------------------------------------------------------------

@@ -177,7 +177,9 @@ def _verify_expectation(run_meta: dict, expectation_item: dict) -> dict:
 
         if len(observed_events) > 1:
             status = "duplicate"
-            reasons.append(f"{len(observed_events)} observed events for this expectation")
+            reasons.append(
+                f"{len(observed_events)} observed events for this expectation"
+            )
         else:
             if expected_hash and observed_hash and expected_hash != observed_hash:
                 status = "mismatch"
@@ -209,7 +211,9 @@ def _verify_mode(test_run_id: str) -> dict:
         raise ValueError(f"No run meta found for testRunId={test_run_id}")
 
     expectations = _get_expectations_for_run(test_run_id)
-    print(f"[Verifier/Verify] Found {len(expectations)} expectations for run {test_run_id}")
+    print(
+        f"[Verifier/Verify] Found {len(expectations)} expectations for run {test_run_id}"
+    )
 
     status_counts = Counter()
     for exp_item in expectations:
