@@ -9,10 +9,14 @@ Seeder Lambda Function
 
 import os
 import json
+import logging
+from typing import Optional, List, Dict, Any, Tuple
 import uuid
 from datetime import datetime, timedelta
+import time
 
 import boto3
+from botocore.exceptions import ClientError
 
 TABLE_NAME = os.environ["TABLE_NAME"]
 EVENT_BUS_NAME = os.environ["EVENT_BUS_NAME"]
@@ -21,8 +25,10 @@ S3_BUCKET = os.environ["S3_BUCKET"]
 dynamodb = boto3.resource("dynamodb")
 table = dynamodb.Table(TABLE_NAME)
 events_client = boto3.client("events")
-s3 = boto3.client("s3")
+s3_client = boto3.client("s3")
 
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
 
 def _now_iso() -> str:
     return (
@@ -32,57 +38,184 @@ def _now_iso() -> str:
     )
 
 
-def _load_fixtures_from_s3(scenario: str):
+def _resolve_service_name(raw_service_name: Optional[str]) -> str:
     """
-    Try to load fixtures from S3 at key: fixtures/<scenario>.json
+    Normalise the serviceName:
+    - None or "all" -> "all"
+    - otherwise: lowercased string, used as folder name.
+    """
+    if raw_service_name is None or str(raw_service_name).lower() == "all":
+        return "all"
+    return str(raw_service_name).lower()
 
-    Expected format:
-    [
-      {
-        "detailType": "...",
-        "source": "...",
-        "payloadHash": "...",  # optional
-        "rawS3Key": "...",     # optional
-        ...
-      },
-      ...
-    ]
+
+def _s3_keys_for_service(service_name: str) -> Tuple[str, str]:
     """
-    key = f"fixtures/{scenario}.json"
+    Return (events_key, expectations_key) for a given serviceName.
+    Layout:
+      seed/services/{serviceName}/events.json
+      seed/services/{serviceName}/expectations.json
+    """
+    base_prefix = f"seed/services/{service_name}/"
+    return (
+        base_prefix + "events.json",
+        base_prefix + "expectations.json",
+    )
+
+def _load_s3_json_list(bucket: str, key: str) -> List[Dict[str, Any]]:
+    """
+    Load JSON from S3 and ensure it's a list.
+    If the object does not exist, raise ClientError with NoSuchKey.
+    """
+    logger.info("Loading seed data from s3://%s/%s", bucket, key)
+    resp = s3_client.get_object(Bucket=bucket, Key=key)
+    raw = resp["Body"].read().decode("utf-8")
+    data = json.loads(raw)
+
+    if isinstance(data, list):
+        return data
+    else:
+        logger.error("Expected a JSON array in %s but got %s", key, type(data))
+        raise ValueError(f"Seed file {key} must contain a JSON array")
+
+
+def _load_service_seed_definitions(service_name: str) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], str]:
+    """
+    Try to load events/expectations for the requested serviceName.
+    If those keys don't exist, fall back to 'all'.
+    Returns (events, expectations, effective_service_name).
+    """
+    requested = service_name
+    events_key, expectations_key = _s3_keys_for_service(requested)
+
     try:
-        obj = s3.get_object(Bucket=S3_BUCKET, Key=key)
-        body = obj["Body"].read()
-        fixtures = json.loads(body)
-        return fixtures
-    except s3.exceptions.NoSuchKey:
-        print(
-            f"[Seeder] No fixtures found at s3://{S3_BUCKET}/{key}, using inline sample."
+        events = _load_s3_json_list(S3_BUCKET, events_key)
+        expectations = _load_s3_json_list(S3_BUCKET, expectations_key)
+        logger.info("Loaded seeds for serviceName=%s", requested)
+        return events, expectations, requested
+    except ClientError as e:
+        code = e.response.get("Error", {}).get("Code")
+        if code not in ("NoSuchKey", "NoSuchBucket"):
+            logger.error("Error loading seeds for serviceName=%s: %s", requested, e)
+            raise
+
+        # fall back to 'all'
+        logger.warning(
+            "Seed definitions for serviceName=%s not found, falling back to 'all'",
+            requested,
         )
-        return None
-    except Exception as e:
-        print(f"[Seeder] Error loading fixtures from S3: {e}")
-        return None
+        events_key, expectations_key = _s3_keys_for_service("all")
+        events = _load_s3_json_list(S3_BUCKET, events_key)
+        expectations = _load_s3_json_list(S3_BUCKET, expectations_key)
+        return events, expectations, "all"
 
 
-def _inline_sample_fixtures():
+def _publish_test_events(
+    test_run_id: str,
+    service_name: str,
+    events_definitions: List[Dict[str, Any]],
+) -> int:
     """
-    Very simple sample fixtures for local/dev.
-    Replace with your own or rely on S3-based fixtures.
+    Publishes test events to EventBridge sequentially, with a delay between each
+    to simulate a real service emitting a sequence of status updates over time.
+
+    events_definitions is expected to be an array of objects like:
+
+    {
+      "Source": "orca.integrationtest",
+      "DetailType": "WorkflowRunCreated",
+      "Detail": { ... arbitrary payload ... }
+    }
     """
-    return [
-        {
-            "detailType": "orcabus.sample.step1",
-            "source": "orcabus.integration.test",
-            "payloadHash": None,
-            "rawS3Key": None,
-        },
-        {
-            "detailType": "orcabus.sample.step2",
-            "source": "orcabus.integration.test",
-            "payloadHash": None,
-            "rawS3Key": None,
-        },
-    ]
+    if not events_definitions:
+        logger.info("No events to publish for serviceName=%s", service_name)
+        return 0
+
+    published_count = 0
+
+    for idx, ev in enumerate(events_definitions):
+        detail = ev.get("Detail", {})
+        # Add tracing fields
+        detail.setdefault("testRunId", test_run_id)
+        detail.setdefault("serviceName", service_name)
+        detail.setdefault("testMode", True)
+
+        entry = {
+            "EventBusName": EVENT_BUS_NAME,
+            "Source": ev["Source"],
+            "DetailType": ev["DetailType"],
+            "Detail": json.dumps(detail),
+        }
+
+        logger.info(
+            "Publishing test event %d/%d for testRunId=%s, serviceName=%s",
+            idx + 1,
+            len(events_definitions),
+            test_run_id,
+            service_name,
+        )
+
+        resp = events_client.put_events(Entries=[entry])
+        failed = resp.get("FailedEntryCount", 0)
+        if failed:
+            logger.error("Failed to publish test event %d: %s", idx + 1, resp)
+            raise RuntimeError("One or more events failed to publish")
+
+        published_count += 1
+
+        # If there are more events to send, wait 10 seconds to simulate
+        # a realistic emission interval.
+        if idx < len(events_definitions) - 1:
+            logger.info("Sleeping 10 seconds before publishing next test event")
+            time.sleep(10)
+
+    logger.info(
+        "Published %d test events to EventBridge for testRunId=%s, serviceName=%s",
+        published_count,
+        test_run_id,
+        service_name,
+    )
+    return published_count
+
+def _write_expectations(
+    test_run_id: str,
+    service_name: str,
+    expectations: List[Dict[str, Any]],
+) -> int:
+    """
+    Writes expectation items into DynamoDB.
+
+    Each expectation JSON can be arbitrary; we wrap it with:
+
+      pk = f"run#{testRunId}"
+      sk = f"expectation#{<id or index>}"
+    """
+    if not expectations:
+        logger.info("No expectations to write for serviceName=%s", service_name)
+        return 0
+
+    count = 0
+    with table.batch_writer() as batch:
+        for idx, exp in enumerate(expectations, start=1):
+            exp_id = exp.get("id") or f"{idx:03d}"
+
+            item = {
+                "pk": f"run#{test_run_id}",
+                "sk": f"expectation#{exp_id}",
+                "testRunId": test_run_id,
+                "serviceName": service_name,
+                "expected": exp,
+            }
+            batch.put_item(Item=item)
+            count += 1
+
+    logger.info(
+        "Wrote %d expectation items to DynamoDB for testRunId=%s, serviceName=%s",
+        count,
+        test_run_id,
+        service_name,
+    )
+    return count
 
 
 def handler(event, context):
@@ -101,75 +234,52 @@ def handler(event, context):
     """
     print(f"[Seeder] Event: {json.dumps(event)}")
 
-    run_id = event.get("runId") or str(uuid.uuid4())
-    scenario = event.get("scenario", "default-scenario")
+    # You can also derive testRunId from event if you prefer something deterministic
+    test_run_id = f"it-{uuid.uuid4()}"
+    raw_service_name = event.get("serviceName")
+    requested_service_name = _resolve_service_name(raw_service_name)
 
-    # 1. Load fixtures (S3 first, then inline fallback)
-    fixtures = _load_fixtures_from_s3(scenario)
-    if fixtures is None:
-        fixtures = _inline_sample_fixtures()
+    logger.info(
+        "Starting seeding for testRunId=%s, requestedServiceName=%s (raw=%r)",
+        test_run_id,
+        requested_service_name,
+        raw_service_name,
+    )
 
-    expected_slots = len(fixtures)
-    now = datetime.utcnow()
+    try:
+        events_defs, expectation_defs, effective_service_name = _load_service_seed_definitions(
+            requested_service_name
+        )
+    except ClientError as e:
+        logger.error("Error loading seed definitions for serviceName=%s: %s", requested_service_name, e)
+        raise
+
+    published_count = _publish_test_events(test_run_id, effective_service_name, events_defs)
+    expectations_count = _write_expectations(test_run_id, effective_service_name, expectation_defs)
+
+    now = datetime.now(tz=datetime.timezone.utc)
     started_at = _now_iso()
-    timeout_at = (now + timedelta(minutes=2)).isoformat(timespec="seconds") + "Z"
+    timeout_at = (now + timedelta(minutes=15)).isoformat(timespec="seconds") + "Z"
 
     # 2. Create run meta item
     meta_item = {
-        "pk": f"run#{run_id}",
+        "pk": f"run#{test_run_id}",
         "sk": "run#meta",
-        "runId": run_id,
-        "scenario": scenario,
-        "expectedSlots": expected_slots,
+        "runId": test_run_id,
+        "serviceName": effective_service_name,
+        "expectedSlots": expectations_count,
         "observedCount": 0,
         "status": "running",
         "startedAt": started_at,
         "timeoutAt": timeout_at,
     }
     table.put_item(Item=meta_item)
-    print(f"[Seeder] Created run meta for {run_id}")
-
-    # 3. Create slot items
-    with table.batch_writer() as batch:
-        for idx, fixture in enumerate(fixtures, start=1):
-            slot_item = {
-                "pk": f"run#{run_id}",
-                "sk": f"slot#seq#{idx:06d}",
-                "runId": run_id,
-                "slotType": "seq",
-                "slotId": idx,
-                "expected": fixture,
-                "observedEvents": [],
-                "verdict": {
-                    "status": "pending",
-                    "reasons": [],
-                },
-            }
-            batch.put_item(Item=slot_item)
-    print(f"[Seeder] Wrote {expected_slots} slot items for run {run_id}")
-
-    # 4. Emit seed event to EventBridge (testMode=true)
-    detail = {
-        "testMode": True,
-        "testId": run_id,
-        "scenario": scenario,
-    }
-    events_client.put_events(
-        Entries=[
-            {
-                "Source": "orcabus.integration.test-harness",
-                "DetailType": "orcabus.integration.seed",
-                "EventBusName": EVENT_BUS_NAME,
-                "Detail": json.dumps(detail),
-            }
-        ]
-    )
-    print(f"[Seeder] Sent seed event for run {run_id} to bus {EVENT_BUS_NAME}")
+    print(f"[Seeder] Created run meta for {test_run_id}")
 
     return {
-        "runId": run_id,
-        "scenario": scenario,
-        "expectedSlots": expected_slots,
+        "testRunId": test_run_id,
+        "serviceName": effective_service_name,
+        "expectedSlots": expectations_count,
         "startedAt": started_at,
         "timeoutAt": timeout_at,
     }

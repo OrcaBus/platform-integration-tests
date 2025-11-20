@@ -2,14 +2,21 @@
 """
 Collector
 
-Event mode (triggered by EventBridge rule):
-   - EventBridge sends events with detail.testMode = true.
-   - Collector:
-     - Maps event to a slot (naive matching by detailType for now).
-     - Appends an entry to observedEvents.
-     - If first observed event for that slot, increments observedCount on run meta.
-     - Optionally stores full event payload in S3.
+Triggered by EventBridge rule.
 
+EventBridge sends events that include:
+
+  detail.testMode   (bool, optional but recommended)
+  detail.testRunId  (string, required for test runs)
+
+Collector:
+  - Ignores events without detail.testRunId (not part of an integration test run).
+  - Loads run meta (run#meta) to ensure the run exists.
+  - Stores the full EventBridge event into S3 using a time-based path.
+  - Finds a matching expectation item for this event (naive by detailType).
+  - Appends an entry to expectation.observedEvents.
+  - If this is the first observed event for that expectation, increments
+    observedCount on the run meta item.
 """
 
 import hashlib
@@ -41,14 +48,27 @@ def _hash_payload(payload) -> str:
         return ""
 
 
-def _store_event_payload(run_id: str, event_id: str, full_event: dict) -> str:
+def _store_event_payload(test_run_id: str, event_id: str, full_event: dict) -> str:
     """
     Store the full EventBridge event in S3 and return the key.
+
+    Path layout (time-based hierarchy):
+
+      events/testruns/{testRunId}/{YYYY}/{MM}/{DD}/{timestamp}-{eventId}.json
     """
-    key = f"events/{run_id}/{event_id}.json"
+    now = datetime.utcnow()
+    yyyy = now.strftime("%Y")
+    mm = now.strftime("%m")
+    dd = now.strftime("%d")
+    ts = now.strftime("%Y-%m-%dT%H-%M-%SZ")
+
+    key = f"events/testruns/{test_run_id}/{yyyy}/{mm}/{dd}/{ts}-{event_id}.json"
+
     try:
         s3.put_object(
-            Bucket=S3_BUCKET, Key=key, Body=json.dumps(full_event).encode("utf-8")
+            Bucket=S3_BUCKET,
+            Key=key,
+            Body=json.dumps(full_event).encode("utf-8"),
         )
         return key
     except Exception as e:
@@ -56,89 +76,125 @@ def _store_event_payload(run_id: str, event_id: str, full_event: dict) -> str:
         return ""
 
 
-def _get_run_meta(run_id: str):
-    resp = table.get_item(Key={"pk": f"run#{run_id}", "sk": "run#meta"})
+def _get_run_meta(test_run_id: str):
+    resp = table.get_item(Key={"pk": f"run#{test_run_id}", "sk": "run#meta"})
     return resp.get("Item")
 
 
-def _get_slots_for_run(run_id: str):
+def _get_expectations_for_run(test_run_id: str):
+    """
+    Fetch all expectation items for this run:
+
+      pk = run#{testRunId}
+      sk begins_with expectation#
+    """
     resp = table.query(
-        KeyConditionExpression=Key("pk").eq(f"run#{run_id}")
-        & Key("sk").begins_with("slot#")
+        KeyConditionExpression=Key("pk").eq(f"run#{test_run_id}")
+        & Key("sk").begins_with("expectation#")
     )
     return resp.get("Items", [])
 
 
-def _find_slot_for_event(run_id: str, detail_type: str):
+def _find_expectation_for_event(test_run_id: str, detail_type: str):
     """
-    Naive mapping: find the first slot whose expected.detailType matches
-    and that still has zero observedEvents. Replace with your own logic later.
+    Naive mapping: find the first expectation whose expected.detailType matches
+    and that still has zero observedEvents. If none are empty, return the first match.
+
+    Expectation item shape (written by Seeder):
+
+      {
+        "pk": "run#{testRunId}",
+        "sk": "expectation#{id}",
+        "testRunId": "...",
+        "serviceName": "...",
+        "expected": {
+          "detailType": "WorkflowRunCreated",
+          ...
+        },
+        "observedEvents": [ ... ]  # optional
+      }
     """
-    slots = _get_slots_for_run(run_id)
+    expectations = _get_expectations_for_run(test_run_id)
     chosen = None
-    for slot in slots:
-        expected = slot.get("expected", {}) or {}
-        if expected.get("detailType") == detail_type:
-            if not slot.get("observedEvents"):
-                return slot
-            if chosen is None:
-                chosen = slot
+
+    for exp_item in expectations:
+        expected = exp_item.get("expected", {}) or {}
+        if expected.get("detailType") != detail_type:
+            continue
+
+        observed = exp_item.get("observedEvents") or []
+        if not observed:
+            # Prefer expectations that haven't seen any events yet
+            return exp_item
+
+        if chosen is None:
+            chosen = exp_item
+
     return chosen
 
 
 def handler(event, context):
     """
-    This Lambda is triggered by EventBridge rule with testMode=true.
+    EventBridge event shape (simplified):
 
-    EventBridge event shape:
-    {
-      "id": "...",
-      "source": "...",
-      "detail-type": "...",
-      "detail": {
-        "testMode": true,
-        "testId": "<runId>",
+      {
+        "id": "...",
+        "source": "...",
+        "detail-type": "...",
+        "detail": {
+          "testMode": true,
+          "testRunId": "<runId>",
+          ...
+        },
         ...
-      },
-      ...
-    }
+      }
     """
     print(f"[Collector] EventBridge event: {json.dumps(event)}")
 
     detail = event.get("detail") or {}
-    run_id = detail.get("testId")
-    if not run_id:
-        print("[Collector] No testId in event.detail, ignoring.")
-        return {"ignored": True, "reason": "no_testId"}
 
-    run_meta = _get_run_meta(run_id)
+    # Only handle events that belong to a test run
+    test_run_id = detail.get("testRunId")
+    if not test_run_id:
+        print("[Collector] No testRunId in event.detail, ignoring.")
+        return {"ignored": True, "reason": "no_testRunId"}
+
+    # Optional: further guard by testMode if you set it in Seeder
+    if not detail.get("testMode", False):
+        print(
+            f"[Collector] testMode is not true for testRunId={test_run_id}, ignoring."
+        )
+        return {"ignored": True, "reason": "testMode_not_true", "testRunId": test_run_id}
+
+    run_meta = _get_run_meta(test_run_id)
     if not run_meta:
-        print(f"[Collector] No run meta found for runId={run_id}, ignoring event.")
-        return {"ignored": True, "reason": "no_run_meta", "runId": run_id}
+        print(f"[Collector] No run meta found for testRunId={test_run_id}, ignoring.")
+        return {"ignored": True, "reason": "no_run_meta", "testRunId": test_run_id}
 
     event_id = event.get("id", "")
     detail_type = event.get("detail-type", "")
 
-    # Store full payload in S3 (optional)
-    s3_key = _store_event_payload(run_id, event_id, event)
+    # Store full payload in S3 first (time-based path)
+    s3_key = _store_event_payload(test_run_id, event_id, event)
     payload_hash = _hash_payload(detail)
 
-    # Find a slot to attach this event to
-    slot = _find_slot_for_event(run_id, detail_type)
-    if not slot:
+    # Find a matching expectation to attach this observed event to
+    expectation_item = _find_expectation_for_event(test_run_id, detail_type)
+    if not expectation_item:
         print(
-            f"[Collector] No matching slot found for runId={run_id}, detailType={detail_type}"
+            f"[Collector] No matching expectation found for "
+            f"testRunId={test_run_id}, detailType={detail_type}"
         )
         return {
-            "runId": run_id,
+            "testRunId": test_run_id,
             "attached": False,
-            "reason": "no_matching_slot",
+            "reason": "no_matching_expectation",
         }
 
-    slot_pk = slot["pk"]
-    slot_sk = slot["sk"]
-    observed_events = slot.get("observedEvents", [])
-    is_first_for_slot = len(observed_events) == 0
+    pk = expectation_item["pk"]
+    sk = expectation_item["sk"]
+    observed_events = expectation_item.get("observedEvents", [])
+    is_first_for_expectation = len(observed_events) == 0
 
     new_observed = {
         "eventId": event_id,
@@ -149,35 +205,39 @@ def handler(event, context):
         "matchReason": "detailType",
     }
 
-    # Update slot: append to observedEvents
+    # Update expectation item: append to observedEvents
     try:
         table.update_item(
-            Key={"pk": slot_pk, "sk": slot_sk},
-            UpdateExpression="SET observedEvents = list_append(if_not_exists(observedEvents, :empty), :new)",
+            Key={"pk": pk, "sk": sk},
+            UpdateExpression=(
+                "SET observedEvents = list_append(if_not_exists(observedEvents, :empty), :new)"
+            ),
             ExpressionAttributeValues={
                 ":empty": [],
                 ":new": [new_observed],
             },
         )
-        print(f"[Collector] Appended observed event to {slot_pk} / {slot_sk}")
+        print(f"[Collector] Appended observed event to {pk} / {sk}")
     except Exception as e:
-        print(f"[Collector] Failed to update slot item: {e}")
-        return {"runId": run_id, "attached": False, "error": str(e)}
+        print(f"[Collector] Failed to update expectation item: {e}")
+        return {"testRunId": test_run_id, "attached": False, "error": str(e)}
 
-    # If first event for this slot, increment observedCount on run meta
-    if is_first_for_slot:
+    # If first event for this expectation, increment observedCount on run meta
+    if is_first_for_expectation:
         try:
             table.update_item(
-                Key={"pk": f"run#{run_id}", "sk": "run#meta"},
-                UpdateExpression="SET observedCount = if_not_exists(observedCount, :zero) + :one",
+                Key={"pk": f"run#{test_run_id}", "sk": "run#meta"},
+                UpdateExpression=(
+                    "SET observedCount = if_not_exists(observedCount, :zero) + :one"
+                ),
                 ExpressionAttributeValues={":zero": 0, ":one": 1},
             )
-            print(f"[Collector] Incremented observedCount for runId={run_id}")
+            print(f"[Collector] Incremented observedCount for testRunId={test_run_id}")
         except Exception as e:
             print(f"[Collector] Failed to increment observedCount: {e}")
 
     return {
-        "runId": run_id,
-        "slotKey": {"pk": slot_pk, "sk": slot_sk},
+        "testRunId": test_run_id,
+        "expectationKey": {"pk": pk, "sk": sk},
         "attached": True,
     }

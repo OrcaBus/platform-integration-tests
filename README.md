@@ -18,7 +18,6 @@ platform-integration-tests
       - [Requirements](#requirements)
       - [Install Dependencies](#install-dependencies)
       - [First Steps](#first-steps)
-    - [Conventions](#conventions)
     - [Linting \& Formatting](#linting--formatting)
     - [Testing](#testing)
   - [Glossary \& References](#glossary--references)
@@ -283,7 +282,7 @@ Service specific terms:
 
 | Term      | Description                                      |
 |-----------|--------------------------------------------------|
-| `testId` / `runId` | Unique identifier for a test execution run |
+| `testRunId`  | Unique identifier for a test execution run |
 | Slot | A placeholder for an expected event, containing both the fixture (expected) and observed event data |
 | Fixture | Expected event data that defines what should be observed during a test run |
 | Verdict | The pass/fail status and reasons for a test run or individual event slot |
