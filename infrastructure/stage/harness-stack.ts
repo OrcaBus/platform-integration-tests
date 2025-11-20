@@ -234,7 +234,15 @@ export class IntegrationTestsHarnessStack extends Stack {
     // Step Functions Definition
     // -------------------------
 
-    // 1. SeedScenario: Seeder will create testRunId + meta + slot items, and emit seed events.
+    // 1. RuleController: Enable/disable the collector rule
+    const enableRuleTask = new LambdaInvoke(this, 'EnableRule', {
+      lambdaFunction: ruleController,
+      payload: TaskInput.fromObject({
+        action: 'enable',
+      }),
+    });
+
+    // 2. SeedScenario: Seeder will create testRunId + meta + slot items, and emit seed events.
     // Seeder is responsible for generating and returning `testRunId`.
     const seedScenarioTask = new LambdaInvoke(this, 'SeedScenario', {
       lambdaFunction: seeder,
@@ -242,14 +250,6 @@ export class IntegrationTestsHarnessStack extends Stack {
       // Seeder returns { testRunId, scenario, expectedSlots, ... }
       // We store that under $.seedResult
       resultPath: '$.seedResult',
-    });
-
-    // 2. RuleController: Enable/disable the collector rule
-    const enableRuleTask = new LambdaInvoke(this, 'EnableRule', {
-      lambdaFunction: ruleController,
-      payload: TaskInput.fromObject({
-        action: 'enable',
-      }),
     });
 
     // 3. CheckRunStatus: call Verifier in "status" mode
