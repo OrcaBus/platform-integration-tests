@@ -1,0 +1,53 @@
+[
+  {
+    "detail-type": "SequenceRunStateChange",
+    "source": "orcabus.sequencerunmanager",
+    "detail": {
+      "id": "seq.IT001",
+      "instrumentRunId": "251125_A01052_0001_IT001",
+      "runVolumeName": "bssh.testvolume.it001",
+      "runFolderPath": "",
+      "runDataUri": "gds://bssh.testvolume.it001",
+      "sampleSheetName": "sampleSheet_it_test.csv",
+      "startTime": "2025-11-25T01:59:30.000Z",
+      "endTime": null,
+      "status": "STARTED"
+    },
+    "__match": {
+      "fields": [
+        "detail-type",
+        "source",
+        "detail.instrumentRunId",
+        "detail.runVolumeName",
+        "detail.runFolderPath",
+        "detail.runDataUri",
+        "detail.sampleSheetName",
+        "detail.status"
+      ]
+    }
+  },
+  {
+    "detail-type": "SequenceRunStateChange",
+    "source": "orcabus.sequencerunmanager",
+    "detail": {
+      "instrumentRunId": "251125_A01052_0001_IT001",
+      "runVolumeName": "bssh.testvolume.it001",
+      "runFolderPath": "",
+      "runDataUri": "gds://bssh.testvolume.it001",
+      "sampleSheetName": "sampleSheet_it_test.csv",
+      "status": "SUCCEEDED"
+    },
+    "__match": {
+      "fields": [
+        "detail-type",
+        "source",
+        "detail.instrumentRunId",
+        "detail.runVolumeName",
+        "detail.runFolderPath",
+        "detail.runDataUri",
+        "detail.sampleSheetName",
+        "detail.status"
+      ]
+    }
+  }
+]
