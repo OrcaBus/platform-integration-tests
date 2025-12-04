@@ -136,7 +136,7 @@ def _render_template(template: str, context: Dict[str, Any]) -> str:
 
 def _get_run_meta(test_run_id: str) -> Dict[str, Any]:
     """Get run meta from DynamoDB."""
-    resp = table.get_item(Key={"pk": f"run#{test_run_id}", "sk": "run#meta"})
+    resp = table.get_item(Key={"testId": f"run#{test_run_id}", "sk": "run#meta"})
     return resp.get("Item", {})
 
 
@@ -144,7 +144,7 @@ def _get_matched_events(test_run_id: str) -> List[Dict[str, Any]]:
     """Get all matched events (status=matched) for this run."""
     try:
         resp = table.query(
-            KeyConditionExpression=Key("pk").eq(f"run#{test_run_id}")
+            KeyConditionExpression=Key("testId").eq(f"run#{test_run_id}")
             & Key("sk").begins_with("event#"),
             FilterExpression=Attr("status").eq("matched"),
         )
@@ -161,7 +161,7 @@ def _get_missing_events(test_run_id: str) -> List[Dict[str, Any]]:
     """Get all missing events (expectation#*-missing) for this run."""
     try:
         resp = table.query(
-            KeyConditionExpression=Key("pk").eq(f"run#{test_run_id}")
+            KeyConditionExpression=Key("testId").eq(f"run#{test_run_id}")
             & Key("sk").begins_with("expectation#"),
             FilterExpression=Attr("status").eq("missed"),
         )
@@ -178,7 +178,7 @@ def _get_unexpected_events(test_run_id: str) -> List[Dict[str, Any]]:
     """Get all unexpected events (status=unexpected) for this run."""
     try:
         resp = table.query(
-            KeyConditionExpression=Key("pk").eq(f"run#{test_run_id}")
+            KeyConditionExpression=Key("testId").eq(f"run#{test_run_id}")
             & Key("sk").begins_with("event#"),
             FilterExpression=Attr("status").eq("unexpected"),
         )
@@ -322,7 +322,7 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     # Update run meta with reportS3Key
     try:
         table.update_item(
-            Key={"pk": f"run#{test_run_id}", "sk": "run#meta"},
+            Key={"testId": f"run#{test_run_id}", "sk": "run#meta"},
             UpdateExpression="SET reportS3Key = :key",
             ExpressionAttributeValues={":key": key},
         )

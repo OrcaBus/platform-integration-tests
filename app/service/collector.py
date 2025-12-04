@@ -79,7 +79,7 @@ def _store_event_payload(test_run_id: str, event_id: str, full_event: dict) -> s
 
 
 def _get_run_meta(test_run_id: str):
-    resp = table.get_item(Key={"pk": f"run#{test_run_id}", "sk": "run#meta"})
+    resp = table.get_item(Key={"testId": f"run#{test_run_id}", "sk": "run#meta"})
     return resp.get("Item")
 
 
@@ -131,7 +131,7 @@ def handler(event, context):
 
     # Write observed event record to DynamoDB
     event_item = {
-        "pk": f"run#{test_run_id}",
+        "testId": f"run#{test_run_id}",
         "sk": sk,
         "testRunId": test_run_id,
         "eventId": event_id,
@@ -155,5 +155,5 @@ def handler(event, context):
     return {
         "testRunId": test_run_id,
         "stored": True,
-        "eventKey": {"pk": f"run#{test_run_id}", "sk": sk},
+        "eventKey": {"testId": f"run#{test_run_id}", "sk": sk},
     }

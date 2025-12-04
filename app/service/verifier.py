@@ -59,7 +59,7 @@ def _parse_iso(dt_str: str):
 
 
 def _get_run_meta(test_run_id: str):
-    resp = table.get_item(Key={"pk": f"run#{test_run_id}", "sk": "run#meta"})
+    resp = table.get_item(Key={"testId": f"run#{test_run_id}", "sk": "run#meta"})
     return resp.get("Item")
 
 
@@ -87,7 +87,7 @@ def _get_observed_events(
     """
     try:
         resp = table.query(
-            KeyConditionExpression=Key("pk").eq(f"run#{test_run_id}")
+            KeyConditionExpression=Key("testId").eq(f"run#{test_run_id}")
             & Key("sk").begins_with("event#"),
             FilterExpression=Attr("detailType").eq(detail_type)
             & Attr("source").eq(source),
@@ -214,7 +214,7 @@ def _status_mode(test_run_id: str) -> dict:
     # Count observed events
     try:
         resp = table.query(
-            KeyConditionExpression=Key("pk").eq(f"run#{test_run_id}")
+            KeyConditionExpression=Key("testId").eq(f"run#{test_run_id}")
             & Key("sk").begins_with("event#")
         )
         observed_count = len(resp.get("Items", []))
@@ -233,7 +233,7 @@ def _status_mode(test_run_id: str) -> dict:
             if current_status != "timeout":
                 try:
                     table.update_item(
-                        Key={"pk": meta["pk"], "sk": meta["sk"]},
+                        Key={"testId": meta["testId"], "sk": meta["sk"]},
                         UpdateExpression="SET #s = :timeout",
                         ExpressionAttributeNames={"#s": "status"},
                         ExpressionAttributeValues={":timeout": "timeout"},
@@ -252,7 +252,7 @@ def _status_mode(test_run_id: str) -> dict:
         if current_status != "ready":
             try:
                 table.update_item(
-                    Key={"pk": meta["pk"], "sk": meta["sk"]},
+                    Key={"testId": meta["testId"], "sk": meta["sk"]},
                     UpdateExpression="SET #s = :ready",
                     ExpressionAttributeNames={"#s": "status"},
                     ExpressionAttributeValues={":ready": "ready"},
@@ -322,7 +322,7 @@ def _verify_mode(test_run_id: str) -> dict:
         if matched_event:
             # Write match info to DynamoDB
             matched_count += 1
-            event_key = {"pk": matched_event["pk"], "sk": matched_event["sk"]}
+            event_key = {"testId": matched_event["testId"], "sk": matched_event["sk"]}
             matched_event_keys.append(event_key)
 
             try:
@@ -351,7 +351,7 @@ def _verify_mode(test_run_id: str) -> dict:
 
             try:
                 missing_item = {
-                    "pk": f"run#{test_run_id}",
+                    "testId": f"run#{test_run_id}",
                     "sk": missing_sk,
                     "testRunId": test_run_id,
                     "detailType": detail_type,
@@ -374,14 +374,14 @@ def _verify_mode(test_run_id: str) -> dict:
     unexpected_count = 0
     try:
         resp = table.query(
-            KeyConditionExpression=Key("pk").eq(f"run#{test_run_id}")
+            KeyConditionExpression=Key("testId").eq(f"run#{test_run_id}")
             & Key("sk").begins_with("event#")
         )
         all_observed_events = resp.get("Items", [])
 
         # Check each observed event to see if it was matched
         for event_item in all_observed_events:
-            event_key = {"pk": event_item["pk"], "sk": event_item["sk"]}
+            event_key = {"testId": event_item["testId"], "sk": event_item["sk"]}
             if event_key not in matched_event_keys:
                 # This event was not matched to any expectation
                 unexpected_count += 1
@@ -414,7 +414,7 @@ def _verify_mode(test_run_id: str) -> dict:
     # Update run meta status
     try:
         table.update_item(
-            Key={"pk": meta["pk"], "sk": meta["sk"]},
+            Key={"testId": meta["testId"], "sk": meta["sk"]},
             UpdateExpression="SET #s = :status, verifiedAt = :verifiedAt",
             ExpressionAttributeNames={"#s": "status"},
             ExpressionAttributeValues={":status": run_status, ":verifiedAt": verifier_at},

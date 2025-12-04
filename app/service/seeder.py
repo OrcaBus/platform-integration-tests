@@ -253,7 +253,7 @@ def handler(event, context):
 
     # 2. Create run meta item
     meta_item = {
-        "pk": f"run#{test_run_id}",
+        "testId": f"run#{test_run_id}",
         "sk": "run#meta",
         "runId": test_run_id,
         "serviceName": effective_service_name,
