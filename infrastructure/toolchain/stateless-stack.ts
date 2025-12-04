@@ -14,7 +14,6 @@ export class StatelessStack extends cdk.Stack {
       stack: IntegrationTestsHarnessStack,
       stackName: 'StatelessPlatformItHarnessStack',
       stackConfig: {
-        beta: getIntegrationTestsHarnessStackProps('BETA'),
         gamma: getIntegrationTestsHarnessStackProps('GAMMA'),
       },
       pipelineName: 'StatelessPlatformItHarnessPipeline',

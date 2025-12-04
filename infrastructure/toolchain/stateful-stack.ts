@@ -14,7 +14,6 @@ export class StatefulStack extends cdk.Stack {
       stack: IntegrationTestsStorageStack,
       stackName: 'StatefulPlatformItStorageStack',
       stackConfig: {
-        beta: getIntegrationTestsStorageStackProps('BETA'),
         gamma: getIntegrationTestsStorageStackProps('GAMMA'),
       },
       pipelineName: 'StatefulPlatformItStoragePipeline',

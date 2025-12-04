@@ -183,9 +183,9 @@ pnpm cdk-stateless deploy -e StatelessPlatformItHarnessStack
 
 To build (test) in the dev account
 ```sh
-pnpm cdk synth -e StatelessPlatformItHarnessStack/DeploymentPipeline/OrcaBusBeta/StatelessPlatformItHarnessStack
-pnpm cdk diff -e StatelessPlatformItHarnessStack/DeploymentPipeline/OrcaBusBeta/StatelessPlatformItHarnessStack
-pnpm cdk deploy -e StatelessPlatformItHarnessStack/DeploymentPipeline/OrcaBusBeta/StatelessPlatformItHarnessStack
+pnpm cdk-stateless synth -e StatelessPlatformItHarnessStack/DeploymentPipeline/OrcaBusBeta/StatelessPlatformItHarnessStack
+pnpm cdk-stateless diff -e StatelessPlatformItHarnessStack/DeploymentPipeline/OrcaBusBeta/StatelessPlatformItHarnessStack
+pnpm cdk-stateless deploy -e StatelessPlatformItHarnessStack/DeploymentPipeline/OrcaBusBeta/StatelessPlatformItHarnessStack
 ```
 
 To list all available stateful stacks, run:

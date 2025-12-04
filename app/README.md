@@ -20,8 +20,8 @@ Everything runs as a **serverless test harness**:
 
 The application code is organised around four Lambda functions:
 
-1. **Seeder** – loads seed fixtures from S3, writes expectations to DynamoDB, and publishes test events to OrcaBus.
-2. **Collector** – triggered by OrcaBus test events, archives full events to S3 and attaches them to the matching expectations in DynamoDB.
+1. **Seeder** – loads seed fixtures from S3, creates run metadata in DynamoDB, and publishes test events to OrcaBus.
+2. **Collector** – triggered by OrcaBus test events, archives full events to S3 and writes event metadata to DynamoDB (lightweight archival only).
 3. **Verifier** – evaluates whether the observed events satisfy the expectations and writes verdicts to DynamoDB.
 4. **Reporter** – generates an HTML report for a test run and stores it in S3.
 
@@ -36,11 +36,15 @@ The Step Functions state machine orchestrates one full test run:
 ```text
 EnableCollectorRule (RuleController Lambda)
   └─> SeedScenario (Seeder)
-       └─> Wait / Status Loop (Verifier in "status" mode)
-            └─> VerifyRun (Verifier in "verify" mode")
-                 └─> ReportRun (Reporter)
-                      └─> DisableCollectorRule
-                           └─> Done
+       └─> Wait / Status Loop:
+            ├─> Wait (1 minute)
+            ├─> CheckRunStatus (Verifier in "status" mode)
+            └─> Choice:
+                 ├─> If ready/timeout: VerifyRun (Verifier in "verify" mode)
+                 │    └─> ReportRun (Reporter)
+                 │         └─> DisableCollectorRule
+                 │              └─> Done
+                 └─> If running: loop back to Wait
 ```
 
 **Execution input (simplified):**
@@ -63,44 +67,41 @@ EnableCollectorRule (RuleController Lambda)
 2. **SeedScenario (Seeder Lambda)**
    - Calculates a new `testRunId` (e.g. `it-<uuid>`).
    - Resolves `serviceName` (normalising and falling back to `all` if specific seeds are missing).
-   - Loads seed fixtures from S3 (events + expectations).
+   - Loads seed fixtures from S3 (events.json only; expectations are loaded by Verifier).
    - Writes:
      - One **run meta** item (`run#meta`) in DynamoDB.
-     - One **expectation item** per expected event.
-   - Publishes test events to the EventBridge bus (sequentially with a delay between events).
+   - Publishes test events to the EventBridge bus sequentially with a 1-second delay between events (simulating real service behaviour).
    - Returns:
 
      ```json
      {
        "testRunId": "it-1234",
        "serviceName": "workflowrunmanager",
-       "expectedSlots": 5,
-       "seededEventsCount": 5,
        "startedAt": "...",
        "timeoutAt": "..."
      }
      ```
 
 3. **Wait / Status Loop (Verifier in "status" mode)**
-   - The state machine waits (e.g. 5 seconds), then calls Verifier with:
+   - The state machine waits 1 minute, then calls Verifier with:
 
      ```json
      { "testRunId": "it-1234", "mode": "status" }
      ```
 
-   - Verifier reads the **run meta** item and returns:
+   - Verifier loads expectations from S3 to count expected events, counts observed events from DynamoDB, and returns:
 
      ```json
      {
        "status": "running|ready|timeout|unknown",
        "runId": "it-1234",
        "observedCount": 3,
-       "expectedSlots": 5
+       "expectedCount": 5
      }
      ```
 
    - Loop continues while `status = "running"`.
-   - Exits the loop when `status = "ready"` (all expectations have at least one observed event) or `status = "timeout"`.
+   - Exits the loop when `status = "ready"` (all expected events observed) or `status = "timeout"`.
 
 4. **VerifyRun (Verifier in "verify" mode)**
    - Called once the run is `ready` or `timeout`:
@@ -109,16 +110,16 @@ EnableCollectorRule (RuleController Lambda)
      { "testRunId": "it-1234", "mode": "verify" }
      ```
 
-   - Verifier loads all **expectation items** and their `observedEvents`, computes verdicts per expectation, and overall run status:
+   - Verifier loads expectations.json from S3, queries DynamoDB for observed events, matches them using `__match.fields` rules, and writes results:
 
      ```json
      {
        "runId": "it-1234",
        "runStatus": "passed|failed",
-       "slotStatusCounts": {
-         "matched": 4,
-         "missing": 1
-       }
+       "matchedCount": 4,
+       "missingCount": 1,
+       "unexpectedCount": 0,
+       "totalExpected": 5
      }
      ```
 
@@ -162,20 +163,19 @@ EnableCollectorRule (RuleController Lambda)
 **Responsibilities:**
 
 - Generate a unique `testRunId` (e.g. `it-<uuid>`).
-- Resolve `serviceName` (if service-specific fixtures don’t exist, fall back to `"all"`).
-- Load seed fixtures from S3 (see [S3 Layout](#s3-layout)).
+- Resolve `serviceName` (if service-specific fixtures don't exist, fall back to `"all"`).
+- Load seed events from S3 (see [S3 Layout](#s3-layout)).
 - Create a **run meta item** in DynamoDB for `testRunId`.
-- Create one **expectation item** per expected event for this run.
-- Publish test events to EventBridge sequentially with a delay (simulating real service behaviour).
+- Publish test events to EventBridge sequentially with a 1-second delay between events (simulating real service behaviour).
 
-Each event published by Seeder includes in its `detail`:
+Each event in `events.json` can optionally include `__injectTestId: true` to automatically inject test tracing fields. When injected, the event's `detail` will include:
 
 ```jsonc
 {
   "testRunId": "<testRunId>",
   "serviceName": "<effectiveServiceName>",
   "testMode": true,
-  // ... scenario-specific fields
+  // ... original detail fields
 }
 ```
 
@@ -208,41 +208,31 @@ For each EventBridge event:
 }
 ```
 
-The collector:
+The collector performs lightweight archival only (no matching logic):
 
 1. **Filters test events**
    - Ignores events without `detail.testRunId`.
-   - Ignores events where `detail.testMode != true`.
-
-2. **Ensures run exists**
-   - Loads `run#meta` from DynamoDB for this `testRunId`.
+   - Ensures `run#meta` exists in DynamoDB for this `testRunId`.
    - If not found, the event is ignored (e.g. stray or late event).
 
-3. **Archives full event to S3**
+2. **Archives full event to S3**
    - Stores the entire EventBridge event to:
 
      ```text
      events/testruns/{testRunId}/{YYYY}/{MM}/{DD}/{timestamp}-{eventId}.json
      ```
 
-4. **Attaches observed event to an expectation**
-   - Queries all expectation items for this run:
-     - `pk = run#{testRunId}`
-     - `sk begins_with "expectation#"`
-   - Naively picks an expectation whose `expected.detailType` matches the event’s `detail-type`:
-     - Prefer an expectation with no `observedEvents` yet.
-     - Otherwise, pick the first matching one.
-   - Appends a new entry to `observedEvents` on that expectation, including:
-     - `eventId`
-     - `detailType`
-     - `receivedAt`
-     - `payloadHash`
-     - `rawS3Key` (where the full event is stored in S3)
-     - `matchReason` (e.g. `"detailType"`)
+3. **Writes event metadata to DynamoDB**
+   - Creates an event record with:
+     - `pk`: `run#{testRunId}`
+     - `sk`: `event#{timestamp}-{eventId}`
+     - `detailType`: from the event
+     - `source`: from the event
+     - `payloadHash`: SHA256 hash of the detail payload
+     - `rawS3Key`: S3 key where the full event is stored
+     - `receivedAt`: ISO timestamp
 
-5. **Increments run-level `observedCount`**
-   - If this is the **first observed event** for an expectation, increments `observedCount` on the `run#meta` item.
-   - This allows Verifier (status mode) to treat the run as **ready** once `observedCount >= expectedSlots`.
+   This allows Verifier to query events by `detailType` and `source`, then download full event bodies from S3 for matching.
 
 ---
 
@@ -305,46 +295,37 @@ The Step Functions loop uses this to decide when to move on to full verification
 
 **Responsibilities:**
 
-- Load `run#meta`.
-- Load all **expectation items** for this run.
+1. **Load expectations from S3**
+   - Loads `expectations.json` from `seed/services/{serviceName}/expectations.json`.
 
-- For each expectation:
-  - No `observedEvents` → `status = "missing"`.
-  - Exactly 1 `observedEvents`:
-    - If both expected and observed have `payloadHash` and they differ → `status = "mismatch"`.
-    - Else → `status = "matched"`.
-  - More than 1 `observedEvents` → `status = "duplicate"`.
-  - Optional: compute `latencyMs` between `run.meta.startedAt` and the first `receivedAt`.
+2. **For each expected event (in order):**
+   - Query DynamoDB for observed events matching `testRunId`, `detailType`, and `source`.
+   - Download full event body from S3 using `rawS3Key`.
+   - Apply match rules based on `expectation.__match.fields` (dot-notation paths like `"detail.instrumentRunId"`).
+   - If matched:
+     - Write match info to the event item: `status=matched`, `verifierAt`, `expectedOrder`, `expectedEvent`.
+   - If not matched:
+     - Write missing event item to DynamoDB: `pk`, `sk=expectation#{order}-missing`, `detailType`, `source`, `expectedEvent`, `status=missed`, `verifierAt`, `expectedOrder`.
 
-- Writes **per-expectation verdict**:
+3. **Check for unexpected events**
+   - After all expected events are checked, query DynamoDB for any observed events that weren't matched.
+   - Mark them as `status=unexpected`.
 
-  ```jsonc
-  "verdict": {
-    "status": "matched|missing|mismatch|duplicate|pending",
-    "reasons": ["..."],
-    "latencyMs": 1234,
-    "checkedAt": "2025-11-21T10:10:00Z",
-    "primaryObservedIndex": 0
-  }
-  ```
+4. **Determine overall run status**
+   - If any missing or unexpected events → `runStatus = "failed"`.
+   - If run meta status is `timeout` → `runStatus = "failed"`.
+   - Otherwise → `runStatus = "passed"`.
 
-- Aggregates an **overall run status**:
-  - If any expectation is `missing`, `mismatch`, or `duplicate` → `runStatus = "failed"`.
-  - If run meta status is `timeout` → `runStatus = "failed"` (or keep `"timeout"` if you prefer).
-  - Otherwise → `runStatus = "passed"`.
-
-- Writes run-level status onto `run#meta` and returns:
+5. **Update run meta and return:**
 
   ```jsonc
   {
     "runId": "it-1234",
     "runStatus": "passed|failed",
-    "slotStatusCounts": {
-      "matched": 5,
-      "missing": 0,
-      "mismatch": 0,
-      "duplicate": 0
-    }
+    "matchedCount": 5,
+    "missingCount": 0,
+    "unexpectedCount": 0,
+    "totalExpected": 5
   }
   ```
 
@@ -368,7 +349,12 @@ The Step Functions loop uses this to decide when to move on to full verification
 
 **Responsibilities:**
 
-- Generate an HTML report using a simple template (or Jinja2, via the deps layer).
+- Load run meta from DynamoDB to get additional details (`startedAt`, `verifiedAt`, etc.).
+- Query DynamoDB for:
+  - Matched events (status=matched)
+  - Missing events (expectation#*-missing)
+  - Unexpected events (status=unexpected)
+- Generate an HTML report with detailed tables showing matched, missing, and unexpected events.
 - Store the report in S3 with a **timestamp-first filename**:
 
   ```text
@@ -382,7 +368,7 @@ The Step Functions loop uses this to decide when to move on to full verification
     2025-11-21T10-15-32Z-it-1234.html
   ```
 
-- Optionally update `run#meta` with `reportS3Key` (if desired).
+- Update `run#meta` with `reportS3Key`.
 - Return the S3 location to the state machine:
 
   ```jsonc
@@ -444,20 +430,24 @@ s3://<bucket>/
 // seed/services/workflowrunmanager/events.json
 [
   {
-    "Source": "orca.integrationtest",
-    "DetailType": "WorkflowRunCreated",
-    "Detail": {
-      "workflowId": "wf-123",
-      "status": "created"
-    }
-  },
-  {
-    "Source": "orca.integrationtest",
-    "DetailType": "WorkflowRunUpdated",
-    "Detail": {
-      "workflowId": "wf-123",
-      "status": "running"
-    }
+    "version": "0",
+    "id": "r.it001",
+    "detail-type": "Event from aws:sqs",
+    "source": "Pipe IcaEventPipeConstru-IntegrationTest",
+    "account": "000000000000",
+    "time": "2025-11-25T02:00:00Z",
+    "region": "ap-southeast-2",
+    "resources": [],
+    "detail": {
+      "ica-event": {
+        "gdsFolderPath": "",
+        "gdsVolumeName": "bssh.testvolume.it001",
+        "reagentBarcode": "FAKE123456-RGTEST",
+        "instrumentRunId": "251125_A01052_0001_IT001",
+        "status": "New"
+      }
+    },
+    "__injectTestId": true  // optional: if true, injects testRunId, serviceName, testMode into detail
   }
 ]
 ```
@@ -466,14 +456,23 @@ s3://<bucket>/
 // seed/services/workflowrunmanager/expectations.json
 [
   {
-    "id": "001",
-    "detailType": "WorkflowRunCreated",
-    "payloadHash": "abc123",      // optional, used by verifier if present
-    "...": "..."
-  },
-  {
-    "id": "002",
-    "detailType": "WorkflowRunUpdated"
+    "detail-type": "SequenceRunStateChange",
+    "source": "orcabus.sequencerunmanager",
+    "detail": {
+      "id": "seq.IT001",
+      "instrumentRunId": "251125_A01052_0001_IT001",
+      "runVolumeName": "bssh.testvolume.it001",
+      "status": "STARTED"
+    },
+    "__match": {
+      "fields": [
+        "detail-type",
+        "source",
+        "detail.instrumentRunId",
+        "detail.runVolumeName",
+        "detail.status"
+      ]
+    }
   }
 ]
 ```
@@ -489,7 +488,8 @@ We use a **single DynamoDB table** for everything (configured via `TABLE_NAME` e
 - **Partition key (`pk`)**: `run#<testRunId>`
 - **Sort key (`sk`)**:
   - `run#meta` for the run metadata item.
-  - `expectation#<id>` for each expectation.
+  - `event#{timestamp}-{eventId}` for observed events (from Collector).
+  - `expectation#{order}-missing` for missing expected events (from Verifier).
 
 ### Example Partition for One Run
 
@@ -502,69 +502,41 @@ pk = "run#it-1234"
 │      "sk": "run#meta",
 │      "runId": "it-1234",
 │      "serviceName": "workflowrunmanager",
-│      "expectedSlots": 2,
-│      "observedCount": 2,
 │      "status": "passed",
 │      "startedAt": "2025-11-21T10:00:00Z",
 │      "timeoutAt": "2025-11-21T10:15:00Z",
+│      "verifiedAt": "2025-11-21T10:10:00Z",
 │      "reportS3Key": "reports/testruns/workflowrunmanager/2025/11/21/2025-11-21T10-15-32Z-it-1234.html"
 │    }
 │
-├─ sk = "expectation#001"
+├─ sk = "event#20251121T100005.123-r.it001"
 │    {
 │      "pk": "run#it-1234",
-│      "sk": "expectation#001",
+│      "sk": "event#20251121T100005.123-r.it001",
 │      "testRunId": "it-1234",
-│      "serviceName": "workflowrunmanager",
-│      "expected": {
-│        "detailType": "WorkflowRunCreated",
-│        "payloadHash": "abc123"
-│      },
-│      "observedEvents": [
-│        {
-│          "eventId": "evt-1",
-│          "detailType": "WorkflowRunCreated",
-│          "receivedAt": "2025-11-21T10:00:05Z",
-│          "payloadHash": "abc123",
-│          "rawS3Key": "events/testruns/it-1234/2025/11/21/2025-11-21T10-00-05Z-evt-1.json",
-│          "matchReason": "detailType"
-│        }
-│      ],
-│      "verdict": {
-│        "status": "matched",
-│        "reasons": [],
-│        "latencyMs": 5000,
-│        "checkedAt": "2025-11-21T10:10:00Z",
-│        "primaryObservedIndex": 0
-│      }
+│      "eventId": "r.it001",
+│      "detailType": "SequenceRunStateChange",
+│      "source": "orcabus.sequencerunmanager",
+│      "payloadHash": "abc123...",
+│      "rawS3Key": "events/testruns/it-1234/2025/11/21/2025-11-21T10-00-05Z-r.it001.json",
+│      "receivedAt": "2025-11-21T10:00:05Z",
+│      "status": "matched",  // set by Verifier
+│      "verifierAt": "2025-11-21T10:10:00Z",
+│      "expectedOrder": 0,
+│      "expectedEvent": { ... }  // full expectation from expectations.json
 │    }
 │
-└─ sk = "expectation#002"
+└─ sk = "expectation#001-missing"
      {
        "pk": "run#it-1234",
-       "sk": "expectation#002",
+       "sk": "expectation#001-missing",
        "testRunId": "it-1234",
-       "serviceName": "workflowrunmanager",
-       "expected": {
-         "detailType": "WorkflowRunUpdated"
-       },
-       "observedEvents": [
-         {
-           "eventId": "evt-2",
-           "detailType": "WorkflowRunUpdated",
-           "receivedAt": "2025-11-21T10:00:15Z",
-           "payloadHash": "def456",
-           "rawS3Key": "events/testruns/it-1234/2025/11/21/2025-11-21T10-00-15Z-evt-2.json",
-           "matchReason": "detailType"
-         }
-       ],
-       "verdict": {
-         "status": "matched",
-         "reasons": [],
-         "latencyMs": 15000,
-         "checkedAt": "2025-11-21T10:10:00Z",
-         "primaryObservedIndex": 0
-       }
+       "detailType": "SequenceRunStateChange",
+       "source": "orcabus.sequencerunmanager",
+       "expectedEvent": { ... },  // full expectation from expectations.json
+       "status": "missed",
+       "verifierAt": "2025-11-21T10:10:00Z",
+       "expectedOrder": 1
      }
 ```
 
@@ -576,25 +548,44 @@ pk = "run#it-1234"
 | `sk`           | S    | `run#meta`                                                   |
 | `runId`        | S    | Same as `<testRunId>`                                       |
 | `serviceName`  | S    | Effective service scenario used (`all`, `workflowrunmanager`, etc.) |
-| `expectedSlots`| N    | Number of expectation items for this run                     |
-| `observedCount`| N    | Number of expectations with at least one observed event      |
+| `verifiedAt`   | S    | ISO timestamp when Verifier completed verification          |
 | `status`       | S    | `running`, `ready`, `timeout`, `passed`, or `failed`         |
 | `startedAt`    | S    | ISO timestamp when Seeder started the run                    |
 | `timeoutAt`    | S    | ISO timestamp after which the run is considered timed-out    |
 | `reportS3Key`  | S    | (optional) S3 key of the HTML report                         |
 | `ttl`          | N    | (optional) epoch seconds for automatic expiration            |
 
-### Expectation Item
+### Event Item (from Collector)
 
 | Attribute          | Type | Description                                                 |
 |--------------------|------|-------------------------------------------------------------|
 | `pk`               | S    | `run#<testRunId>`                                           |
-| `sk`               | S    | `expectation#<id>`                                          |
+| `sk`               | S    | `event#{timestamp}-{eventId}`                              |
 | `testRunId`        | S    | The associated run ID                                       |
-| `serviceName`      | S    | Service scenario                                            |
-| `expected`         | M    | Fixture definition (e.g. `detailType`, `payloadHash`)      |
-| `observedEvents`   | L    | List of observed event summaries (from Collector)          |
-| `verdict`          | M    | Per-expectation verdict (from Verifier)                    |
+| `eventId`          | S    | Event ID from EventBridge                                   |
+| `detailType`       | S    | Event detail-type                                           |
+| `source`           | S    | Event source                                                |
+| `payloadHash`      | S    | SHA256 hash of the detail payload                           |
+| `rawS3Key`         | S    | S3 key where full event is stored                           |
+| `receivedAt`       | S    | ISO timestamp when event was received                       |
+| `status`           | S    | Set by Verifier: `matched`, `unexpected`, or null          |
+| `verifierAt`       | S    | ISO timestamp when Verifier processed this event            |
+| `expectedOrder`    | N    | Order index of the matched expectation (if matched)         |
+| `expectedEvent`    | M    | Full expectation object (if matched)                        |
+
+### Missing Event Item (from Verifier)
+
+| Attribute          | Type | Description                                                 |
+|--------------------|------|-------------------------------------------------------------|
+| `pk`               | S    | `run#<testRunId>`                                           |
+| `sk`               | S    | `expectation#{order}-missing`                              |
+| `testRunId`        | S    | The associated run ID                                       |
+| `detailType`       | S    | Expected detail-type                                        |
+| `source`           | S    | Expected source                                             |
+| `expectedEvent`    | M    | Full expectation object from expectations.json              |
+| `status`           | S    | `missed`                                                    |
+| `verifierAt`       | S    | ISO timestamp when Verifier marked this as missing          |
+| `expectedOrder`    | N    | Order index in expectations.json                            |
 
 ---
 

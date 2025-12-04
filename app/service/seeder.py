@@ -12,7 +12,7 @@ import json
 import logging
 from typing import Optional, List, Dict, Any, Tuple
 import uuid
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import time
 
 import boto3
@@ -33,7 +33,7 @@ logger.setLevel(logging.INFO)
 
 def _now_iso() -> str:
     return (
-        datetime.now(tz=datetime.timezone.utc)
+        datetime.now(tz=timezone.utc)
         .isoformat(timespec="seconds")
         .replace("+00:00", "Z")
     )
@@ -83,20 +83,19 @@ def _load_s3_json_list(bucket: str, key: str) -> List[Dict[str, Any]]:
 
 def _load_service_seed_definitions(
     service_name: str,
-) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], str]:
+) -> Tuple[List[Dict[str, Any]], str]:
     """
-    Try to load events/expectations for the requested serviceName.
+    Try to load events for the requested serviceName.
     If those keys don't exist, fall back to 'all'.
-    Returns (events, expectations, effective_service_name).
+    Returns (events, effective_service_name).
     """
     requested = service_name
-    events_key, expectations_key = _s3_keys_for_service(requested)
+    events_key, _ = _s3_keys_for_service(requested)
 
     try:
         events = _load_s3_json_list(S3_BUCKET, events_key)
-        expectations = _load_s3_json_list(S3_BUCKET, expectations_key)
         logger.info("Loaded seeds for serviceName=%s", requested)
-        return events, expectations, requested
+        return events, requested
     except ClientError as e:
         code = e.response.get("Error", {}).get("Code")
         if code not in ("NoSuchKey", "NoSuchBucket"):
@@ -108,10 +107,9 @@ def _load_service_seed_definitions(
             "Seed definitions for serviceName=%s not found, falling back to 'all'",
             requested,
         )
-        events_key, expectations_key = _s3_keys_for_service("all")
+        events_key, _ = _s3_keys_for_service("all")
         events = _load_s3_json_list(S3_BUCKET, events_key)
-        expectations = _load_s3_json_list(S3_BUCKET, expectations_key)
-        return events, expectations, "all"
+        return events, "all"
 
 
 def _publish_test_events(
@@ -123,13 +121,16 @@ def _publish_test_events(
     Publishes test events to EventBridge sequentially, with a delay between each
     to simulate a real service emitting a sequence of status updates over time.
 
-    events_definitions is expected to be an array of objects like:
+    events_definitions is expected to be an array of EventBridge event objects like:
 
     {
-      "Source": "orca.integrationtest",
-      "DetailType": "WorkflowRunCreated",
-      "Detail": { ... arbitrary payload ... }
+      "source": "Pipe IcaEventPipeConstru-IntegrationTest",
+      "detail-type": "Event from aws:sqs",
+      "detail": { ... arbitrary payload ... },
+      "__injectTestId": true  // optional, if true injects test tracing fields
     }
+
+    Supports both lowercase (new format) and capitalized (legacy) field names.
     """
     if not events_definitions:
         logger.info("No events to publish for serviceName=%s", service_name)
@@ -138,25 +139,46 @@ def _publish_test_events(
     published_count = 0
 
     for idx, ev in enumerate(events_definitions):
-        detail = ev.get("Detail", {})
-        # Add tracing fields
-        detail.setdefault("testRunId", test_run_id)
-        detail.setdefault("serviceName", service_name)
-        detail.setdefault("testMode", True)
+        # Extract source and detail-type (handle both lowercase and capitalized)
+        source = ev.get("source") or ev.get("Source")
+        detail_type = ev.get("detail-type") or ev.get("DetailType") or ev.get("detailType")
+
+        if not source:
+            logger.error("Event %d missing 'source' or 'Source' field", idx + 1)
+            raise ValueError(f"Event {idx + 1} must have a 'source' field")
+        if not detail_type:
+            logger.error("Event %d missing 'detail-type' or 'DetailType' field", idx + 1)
+            raise ValueError(f"Event {idx + 1} must have a 'detail-type' field")
+
+        # Extract detail (handle both lowercase and capitalized)
+        detail = ev.get("detail") or ev.get("Detail", {})
+
+        # If detail is not a dict, wrap it or use as-is
+        if not isinstance(detail, dict):
+            detail = {"data": detail}
+
+        # Inject test tracing fields if __injectTestId is True
+        inject_test_id = ev.get("__injectTestId", False)
+        if inject_test_id:
+            detail.setdefault("testRunId", test_run_id)
+            detail.setdefault("serviceName", service_name)
+            detail.setdefault("testMode", True)
 
         entry = {
             "EventBusName": EVENT_BUS_NAME,
-            "Source": ev["Source"],
-            "DetailType": ev["DetailType"],
+            "Source": source,
+            "DetailType": detail_type,
             "Detail": json.dumps(detail),
         }
 
         logger.info(
-            "Publishing test event %d/%d for testRunId=%s, serviceName=%s",
+            "Publishing test event %d/%d for testRunId=%s, serviceName=%s (source=%s, detailType=%s)",
             idx + 1,
             len(events_definitions),
             test_run_id,
             service_name,
+            source,
+            detail_type,
         )
 
         resp = events_client.put_events(Entries=[entry])
@@ -167,11 +189,11 @@ def _publish_test_events(
 
         published_count += 1
 
-        # If there are more events to send, wait 10 seconds to simulate
+        # If there are more events to send, wait 1 second to simulate
         # a realistic emission interval.
         if idx < len(events_definitions) - 1:
-            logger.info("Sleeping 10 seconds before publishing next test event")
-            time.sleep(10)
+            logger.info("Sleeping 1 second before publishing next test event")
+            time.sleep(1)
 
     logger.info(
         "Published %d test events to EventBridge for testRunId=%s, serviceName=%s",
@@ -180,47 +202,6 @@ def _publish_test_events(
         service_name,
     )
     return published_count
-
-
-def _write_expectations(
-    test_run_id: str,
-    service_name: str,
-    expectations: List[Dict[str, Any]],
-) -> int:
-    """
-    Writes expectation items into DynamoDB.
-
-    Each expectation JSON can be arbitrary; we wrap it with:
-
-      pk = f"run#{testRunId}"
-      sk = f"expectation#{<id or index>}"
-    """
-    if not expectations:
-        logger.info("No expectations to write for serviceName=%s", service_name)
-        return 0
-
-    count = 0
-    with table.batch_writer() as batch:
-        for idx, exp in enumerate(expectations, start=1):
-            exp_id = exp.get("id") or f"{idx:03d}"
-
-            item = {
-                "pk": f"run#{test_run_id}",
-                "sk": f"expectation#{exp_id}",
-                "testRunId": test_run_id,
-                "serviceName": service_name,
-                "expected": exp,
-            }
-            batch.put_item(Item=item)
-            count += 1
-
-    logger.info(
-        "Wrote %d expectation items to DynamoDB for testRunId=%s, serviceName=%s",
-        count,
-        test_run_id,
-        service_name,
-    )
-    return count
 
 
 def handler(event, context):
@@ -234,8 +215,7 @@ def handler(event, context):
 
     Seeder will:
     - Create run#meta item
-    - Create one slot item per fixture
-    - Emit initial seed event to EventBridge (testMode=true, testId=runId)
+    - Emit seed events to EventBridge (testMode=true, testId=runId)
     """
     print(f"[Seeder] Event: {json.dumps(event)}")
 
@@ -252,7 +232,7 @@ def handler(event, context):
     )
 
     try:
-        events_defs, expectation_defs, effective_service_name = (
+        events_defs, effective_service_name = (
             _load_service_seed_definitions(requested_service_name)
         )
     except ClientError as e:
@@ -266,21 +246,17 @@ def handler(event, context):
     published_count = _publish_test_events(
         test_run_id, effective_service_name, events_defs
     )
-    expectations_count = _write_expectations(
-        test_run_id, effective_service_name, expectation_defs
-    )
 
-    now = datetime.now(tz=datetime.timezone.utc)
+    now = datetime.now(tz=timezone.utc)
     started_at = _now_iso()
     timeout_at = (now + timedelta(minutes=15)).isoformat(timespec="seconds") + "Z"
 
     # 2. Create run meta item
     meta_item = {
-        "pk": f"run#{test_run_id}",
+        "testId": f"run#{test_run_id}",
         "sk": "run#meta",
         "runId": test_run_id,
         "serviceName": effective_service_name,
-        "expectedSlots": expectations_count,
         "observedCount": 0,
         "status": "running",
         "startedAt": started_at,
@@ -292,7 +268,6 @@ def handler(event, context):
     return {
         "testRunId": test_run_id,
         "serviceName": effective_service_name,
-        "expectedSlots": expectations_count,
         "startedAt": started_at,
         "timeoutAt": timeout_at,
     }

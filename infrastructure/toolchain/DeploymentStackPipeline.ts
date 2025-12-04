@@ -1,33 +1,18 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
 import { Construct } from 'constructs';
-import { Duration, Environment, Stack, StackProps, Stage } from 'aws-cdk-lib';
+import { Environment, Stack, StackProps, Stage } from 'aws-cdk-lib';
 import { BuildSpec, ComputeType, LinuxArmBuildImage } from 'aws-cdk-lib/aws-codebuild';
 import { StringParameter } from 'aws-cdk-lib/aws-ssm';
-import {
-  CodeBuildStep,
-  CodePipeline,
-  CodePipelineActionFactoryResult,
-  CodePipelineSource,
-  ICodePipelineActionFactory,
-  Step,
-} from 'aws-cdk-lib/pipelines';
+import { CodeBuildStep, CodePipeline, CodePipelineSource } from 'aws-cdk-lib/pipelines';
 import {
   Pipeline,
   CfnPipeline,
   PipelineType,
   PipelineNotificationEvents,
-  IStage,
 } from 'aws-cdk-lib/aws-codepipeline';
 import { SlackChannelConfiguration } from 'aws-cdk-lib/aws-chatbot';
 import { DetailType } from 'aws-cdk-lib/aws-codestarnotifications';
-import {
-  ManualApprovalAction,
-  ManualApprovalActionProps,
-} from 'aws-cdk-lib/aws-codepipeline-actions';
-import {
-  BETA_ENVIRONMENT,
-  GAMMA_ENVIRONMENT,
-} from '@orcabus/platform-cdk-constructs/deployment-stack-pipeline';
+import { GAMMA_ENVIRONMENT } from '@orcabus/platform-cdk-constructs/deployment-stack-pipeline';
 import { CrossDeploymentArtifactBucket } from '@orcabus/platform-cdk-constructs/deployment-stack-pipeline';
 
 /**
@@ -45,20 +30,12 @@ export const DEFAULT_SYNTH_STEP_PARTIAL_BUILD_SPEC = {
 
 export interface StageEnvProps {
   /**
-   * The environment for the beta stage
-   */
-  readonly beta: Environment;
-  /**
    * The environment for the gamma stage
    */
   readonly gamma: Environment;
 }
 
 export interface StackConfigProps {
-  /**
-   * The configuration for the beta (dev) stage
-   */
-  readonly beta: Record<string, any>;
   /**
    * The configuration for the gamma (stg) stage
    */
@@ -261,7 +238,6 @@ export class IntegrationTestDeploymentStackPipeline extends Construct {
     });
 
     const defaultStageEnv: StageEnvProps = {
-      beta: BETA_ENVIRONMENT,
       gamma: GAMMA_ENVIRONMENT,
     };
     const stageEnv = props.stageEnv || defaultStageEnv;
@@ -290,28 +266,6 @@ export class IntegrationTestDeploymentStackPipeline extends Construct {
         pre: [stripAssetsFromAssembly],
       });
     }
-
-    cdkPipeline.addStage(
-      new DeploymentStage(
-        this,
-        'OrcaBusBeta',
-        stageEnv.beta,
-        props.stackName,
-        props.stack,
-        props.githubRepo,
-        props.stackConfig.beta,
-        props.githubBranch
-      ),
-      {
-        post: [
-          new ManualApprovalActionStep('PromoteToGamma', {
-            actionName: 'PromoteToGamma',
-            runOrder: 2,
-            timeout: Duration.minutes(60),
-          }),
-        ],
-      }
-    );
 
     cdkPipeline.addStage(
       new DeploymentStage(
@@ -349,39 +303,6 @@ export class IntegrationTestDeploymentStackPipeline extends Construct {
         notificationRuleName: `OrcaBus-${props.pipelineName}`,
       });
     }
-  }
-}
-
-/**
- * Properties for ManualApprovalActionStep with required runOrder.
- */
-interface ManualApprovalActionStepProps extends ManualApprovalActionProps {
-  /**
-   * The run order for this action in the pipeline stage. The stage Pre/Post order does not apply to this custom
-   * step/action, you need to explicitly set the runOrder.
-   */
-  runOrder: number;
-}
-/**
- * Custom manual approval step for CDK CodePipeline.
- *
- * This class bridges the gap to enable using ManualApprovalAction within a Step class,
- * making it compatible with cdk.pipelines constructs.
- *
- * @param id - The unique identifier for the step.
- * @param options - The properties for the manual approval action, including
- */
-class ManualApprovalActionStep extends Step implements ICodePipelineActionFactory {
-  private readonly manualApprovalActionProps: ManualApprovalActionStepProps;
-  constructor(id: string, options: ManualApprovalActionStepProps) {
-    super(id);
-    this.manualApprovalActionProps = options;
-  }
-
-  public produceAction(stage: IStage): CodePipelineActionFactoryResult {
-    stage.addAction(new ManualApprovalAction(this.manualApprovalActionProps));
-
-    return { runOrdersConsumed: 1 };
   }
 }
 

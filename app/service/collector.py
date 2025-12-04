@@ -13,19 +13,21 @@ Collector:
   - Ignores events without detail.testRunId (not part of an integration test run).
   - Loads run meta (run#meta) to ensure the run exists.
   - Stores the full EventBridge event into S3 using a time-based path.
-  - Finds a matching expectation item for this event (naive by detailType).
-  - Appends an entry to expectation.observedEvents.
-  - If this is the first observed event for that expectation, increments
-    observedCount on the run meta item.
+  - Writes observed event record to DynamoDB with:
+    - pk: run#{testRunId}
+    - sk: event#{timestamp}-{eventId}
+    - detailType, source, payloadHash, rawS3Key, receivedAt
+
+This keeps Collector lightweight and fast - just raw archival.
+No matching logic, no status updates, no knowledge of expectations.
 """
 
 import hashlib
 import json
 import os
-from datetime import datetime
+from datetime import datetime, timezone
 
 import boto3
-from boto3.dynamodb.conditions import Key
 
 TABLE_NAME = os.environ["TABLE_NAME"]
 S3_BUCKET = os.environ["S3_BUCKET"]
@@ -36,7 +38,7 @@ s3 = boto3.client("s3")
 
 
 def _now_iso() -> str:
-    return datetime.utcnow().isoformat(timespec="seconds") + "Z"
+    return datetime.now(timezone.utc).isoformat(timespec="seconds") + "Z"
 
 
 def _hash_payload(payload) -> str:
@@ -56,7 +58,7 @@ def _store_event_payload(test_run_id: str, event_id: str, full_event: dict) -> s
 
       events/testruns/{testRunId}/{YYYY}/{MM}/{DD}/{timestamp}-{eventId}.json
     """
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc)
     yyyy = now.strftime("%Y")
     mm = now.strftime("%m")
     dd = now.strftime("%d")
@@ -77,60 +79,8 @@ def _store_event_payload(test_run_id: str, event_id: str, full_event: dict) -> s
 
 
 def _get_run_meta(test_run_id: str):
-    resp = table.get_item(Key={"pk": f"run#{test_run_id}", "sk": "run#meta"})
+    resp = table.get_item(Key={"testId": f"run#{test_run_id}", "sk": "run#meta"})
     return resp.get("Item")
-
-
-def _get_expectations_for_run(test_run_id: str):
-    """
-    Fetch all expectation items for this run:
-
-      pk = run#{testRunId}
-      sk begins_with expectation#
-    """
-    resp = table.query(
-        KeyConditionExpression=Key("pk").eq(f"run#{test_run_id}")
-        & Key("sk").begins_with("expectation#")
-    )
-    return resp.get("Items", [])
-
-
-def _find_expectation_for_event(test_run_id: str, detail_type: str):
-    """
-    Naive mapping: find the first expectation whose expected.detailType matches
-    and that still has zero observedEvents. If none are empty, return the first match.
-
-    Expectation item shape (written by Seeder):
-
-      {
-        "pk": "run#{testRunId}",
-        "sk": "expectation#{id}",
-        "testRunId": "...",
-        "serviceName": "...",
-        "expected": {
-          "detailType": "WorkflowRunCreated",
-          ...
-        },
-        "observedEvents": [ ... ]  # optional
-      }
-    """
-    expectations = _get_expectations_for_run(test_run_id)
-    chosen = None
-
-    for exp_item in expectations:
-        expected = exp_item.get("expected", {}) or {}
-        if expected.get("detailType") != detail_type:
-            continue
-
-        observed = exp_item.get("observedEvents") or []
-        if not observed:
-            # Prefer expectations that haven't seen any events yet
-            return exp_item
-
-        if chosen is None:
-            chosen = exp_item
-
-    return chosen
 
 
 def handler(event, context):
@@ -159,17 +109,6 @@ def handler(event, context):
         print("[Collector] No testRunId in event.detail, ignoring.")
         return {"ignored": True, "reason": "no_testRunId"}
 
-    # Optional: further guard by testMode if you set it in Seeder
-    if not detail.get("testMode", False):
-        print(
-            f"[Collector] testMode is not true for testRunId={test_run_id}, ignoring."
-        )
-        return {
-            "ignored": True,
-            "reason": "testMode_not_true",
-            "testRunId": test_run_id,
-        }
-
     run_meta = _get_run_meta(test_run_id)
     if not run_meta:
         print(f"[Collector] No run meta found for testRunId={test_run_id}, ignoring.")
@@ -177,71 +116,44 @@ def handler(event, context):
 
     event_id = event.get("id", "")
     detail_type = event.get("detail-type", "")
+    source = event.get("source", "")
 
     # Store full payload in S3 first (time-based path)
     s3_key = _store_event_payload(test_run_id, event_id, event)
     payload_hash = _hash_payload(detail)
+    received_at = _now_iso()
 
-    # Find a matching expectation to attach this observed event to
-    expectation_item = _find_expectation_for_event(test_run_id, detail_type)
-    if not expectation_item:
-        print(
-            f"[Collector] No matching expectation found for "
-            f"testRunId={test_run_id}, detailType={detail_type}"
-        )
-        return {
-            "testRunId": test_run_id,
-            "attached": False,
-            "reason": "no_matching_expectation",
-        }
+    # Generate sort key: event#{timestamp}-{eventId}
+    # Use microsecond precision for uniqueness
+    now = datetime.now(timezone.utc)
+    timestamp_str = now.strftime("%Y%m%dT%H%M%S.%f")[:-3]  # milliseconds
+    sk = f"event#{timestamp_str}-{event_id}"
 
-    pk = expectation_item["pk"]
-    sk = expectation_item["sk"]
-    observed_events = expectation_item.get("observedEvents", [])
-    is_first_for_expectation = len(observed_events) == 0
-
-    new_observed = {
+    # Write observed event record to DynamoDB
+    event_item = {
+        "testId": f"run#{test_run_id}",
+        "sk": sk,
+        "testRunId": test_run_id,
         "eventId": event_id,
         "detailType": detail_type,
-        "receivedAt": _now_iso(),
+        "source": source,
         "payloadHash": payload_hash or None,
         "rawS3Key": s3_key or None,
-        "matchReason": "detailType",
+        "receivedAt": received_at,
     }
 
-    # Update expectation item: append to observedEvents
     try:
-        table.update_item(
-            Key={"pk": pk, "sk": sk},
-            UpdateExpression=(
-                "SET observedEvents = list_append(if_not_exists(observedEvents, :empty), :new)"
-            ),
-            ExpressionAttributeValues={
-                ":empty": [],
-                ":new": [new_observed],
-            },
+        table.put_item(Item=event_item)
+        print(
+            f"[Collector] Stored event record for testRunId={test_run_id}, "
+            f"detailType={detail_type}, source={source}"
         )
-        print(f"[Collector] Appended observed event to {pk} / {sk}")
     except Exception as e:
-        print(f"[Collector] Failed to update expectation item: {e}")
-        return {"testRunId": test_run_id, "attached": False, "error": str(e)}
-
-    # If first event for this expectation, increment observedCount on run meta
-    if is_first_for_expectation:
-        try:
-            table.update_item(
-                Key={"pk": f"run#{test_run_id}", "sk": "run#meta"},
-                UpdateExpression=(
-                    "SET observedCount = if_not_exists(observedCount, :zero) + :one"
-                ),
-                ExpressionAttributeValues={":zero": 0, ":one": 1},
-            )
-            print(f"[Collector] Incremented observedCount for testRunId={test_run_id}")
-        except Exception as e:
-            print(f"[Collector] Failed to increment observedCount: {e}")
+        print(f"[Collector] Failed to store event record: {e}")
+        return {"testRunId": test_run_id, "stored": False, "error": str(e)}
 
     return {
         "testRunId": test_run_id,
-        "expectationKey": {"pk": pk, "sk": sk},
-        "attached": True,
+        "stored": True,
+        "eventKey": {"testId": f"run#{test_run_id}", "sk": sk},
     }

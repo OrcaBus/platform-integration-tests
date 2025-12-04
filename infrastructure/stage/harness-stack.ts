@@ -43,6 +43,7 @@ export class IntegrationTestsHarnessStack extends Stack {
   private readonly mainBus: IEventBus;
   private readonly dynamoDBTable: ITable;
   private readonly s3Bucket: IBucket;
+  private readonly serviceName: string = 'PlatformIt';
 
   constructor(
     scope: Construct,
@@ -95,11 +96,12 @@ export class IntegrationTestsHarnessStack extends Stack {
     // Create disabled collector rule
     const collectorRule = this.setupCollectorEventRule(collector);
     // RuleController Lambda
-    const ruleController = this.createRuleControllerFunction(collectorRule);
+    const ruleController = this.createRuleControllerFunction();
 
     this.dynamoDBTable.grantReadWriteData(collector);
     this.s3Bucket.grantReadWrite(collector);
     this.dynamoDBTable.grantReadWriteData(verifier);
+    this.s3Bucket.grantRead(verifier);
     this.dynamoDBTable.grantReadData(reporter);
     this.s3Bucket.grantReadWrite(reporter);
 
@@ -146,7 +148,8 @@ export class IntegrationTestsHarnessStack extends Stack {
   private setupCollectorEventRule(collector: PythonFunction): Rule {
     return new Rule(this, this.stackName + 'CollectorEventRule', {
       eventBus: this.mainBus,
-      ruleName: this.stackName + 'CollectorEventRule',
+      // rule name restriction: https://docs.aws.amazon.com/eventbridge/latest/APIReference/API_Rule.html
+      ruleName: this.serviceName + 'CollectorEventRule',
       description: 'Rule to collect events from the main bus for the integration tests.',
       eventPattern: {
         account: [String(Stack.of(this).account)],
@@ -163,7 +166,7 @@ export class IntegrationTestsHarnessStack extends Stack {
     });
   }
 
-  private createRuleControllerFunction(collectorRule: Rule): PythonFunction {
+  private createRuleControllerFunction(): PythonFunction {
     return this.createPythonFunction('RuleController', {
       index: 'rule_controller.py',
       handler: 'handler',
@@ -171,7 +174,7 @@ export class IntegrationTestsHarnessStack extends Stack {
       // override base env to add RULE_NAME for this function
       environment: {
         ...this.lambdaEnv,
-        RULE_NAME: collectorRule.ruleName,
+        RULE_NAME: this.serviceName + 'CollectorEventRule',
       },
     });
   }
@@ -254,33 +257,33 @@ export class IntegrationTestsHarnessStack extends Stack {
 
     // 3. CheckRunStatus: call Verifier in "status" mode
     // Input to verifier:
-    //   { "runId": <from seedResult>, "mode": "status" }
+    //   { "testRunId": <from seedResult>, "mode": "status" }
     const checkRunStatusTask = new LambdaInvoke(this, 'CheckRunStatus', {
       lambdaFunction: verifier,
       payload: TaskInput.fromObject({
-        runId: JsonPath.stringAt('$.seedResult.runId'),
+        testRunId: JsonPath.stringAt('$.seedResult.testRunId'),
         mode: 'status',
       }),
       payloadResponseOnly: true,
       // Expect verifier to return:
-      // { status: "running|ready|timeout", runId: "...", observedCount, expectedSlots }
+      // { status: "running|ready|timeout", runId: "...", observedCount, expectedCount }
       resultPath: '$.status',
     });
 
     // 4. Wait X seconds
     const waitX = new Wait(this, 'WaitForEvents', {
-      time: WaitTime.duration(Duration.seconds(5)),
+      time: WaitTime.duration(Duration.minutes(1)),
     });
 
     // 5. Verify: call Verifier in "verify" mode once ready/timeout
     const verifyTask = new LambdaInvoke(this, 'VerifyRun', {
       lambdaFunction: verifier,
       payload: TaskInput.fromObject({
-        runId: JsonPath.stringAt('$.seedResult.runId'),
+        testRunId: JsonPath.stringAt('$.seedResult.testRunId'),
         mode: 'verify',
       }),
       payloadResponseOnly: true,
-      // Verifier returns e.g. { runId, runStatus, slotStatusCounts }
+      // Verifier returns e.g. { runId, runStatus, matchedCount, missingCount, unexpectedCount, totalExpected }
       resultPath: '$.verifyResult',
     });
 
@@ -288,7 +291,7 @@ export class IntegrationTestsHarnessStack extends Stack {
     const reportTask = new LambdaInvoke(this, 'ReportRun', {
       lambdaFunction: reporter,
       payload: TaskInput.fromObject({
-        runId: JsonPath.stringAt('$.seedResult.testRunId'),
+        testRunId: JsonPath.stringAt('$.seedResult.testRunId'),
         verifyResult: JsonPath.stringAt('$.verifyResult'),
         // safe if you always document that callers pass serviceName or Seeder sets it in seedResult
         serviceName: JsonPath.stringAt('$.seedResult.serviceName'),
@@ -312,22 +315,23 @@ export class IntegrationTestsHarnessStack extends Stack {
       resultPath: '$.final',
     });
 
-    // verify -> report -> done chain
-    const verifyReportChain = verifyTask
+    // verify -> report -> disable -> done chain (only when ready/timeout)
+    const verifyAndReportChain = verifyTask
       .next(reportTask)
       .next(disableCollectorTask)
       .next(finalState);
 
     // Choice based on status.status
     const statusChoice = new Choice(this, 'RunReadyOrTimeout?')
-      .when(Condition.stringEquals('$.status.status', 'ready'), verifyReportChain)
-      .when(Condition.stringEquals('$.status.status', 'timeout'), verifyReportChain)
+      .when(Condition.stringEquals('$.status.status', 'ready'), verifyAndReportChain)
+      .when(Condition.stringEquals('$.status.status', 'timeout'), verifyAndReportChain)
       // Otherwise, wait again
       .otherwise(waitX);
 
+    // Loop: wait -> check status -> (if ready/timeout: verify -> report -> disable, else: wait again)
     const waitLoop = waitX.next(checkRunStatusTask).next(statusChoice);
 
-    // Main chain
+    // Main chain: enable rule -> seed -> loop
     return enableRuleTask.next(seedScenarioTask).next(waitLoop);
   }
 }
