@@ -111,7 +111,6 @@ def _load_service_seed_definitions(
         events = _load_s3_json_list(S3_BUCKET, events_key)
         return events, "all"
 
-
 def _publish_test_events(
     test_run_id: str,
     service_name: str,
@@ -163,6 +162,7 @@ def _publish_test_events(
             detail.setdefault("testRunId", test_run_id)
             detail.setdefault("serviceName", service_name)
             detail.setdefault("testMode", True)
+            detail.setdefault("instrumentRunId", test_run_id)
 
         entry = {
             "EventBusName": EVENT_BUS_NAME,
@@ -249,7 +249,7 @@ def handler(event, context):
 
     now = datetime.now(tz=timezone.utc)
     started_at = _now_iso()
-    timeout_at = (now + timedelta(minutes=15)).isoformat(timespec="seconds") + "Z"
+    timeout_at = (now + timedelta(minutes=5)).isoformat(timespec="seconds") + "Z"
 
     # 2. Create run meta item
     meta_item = {
