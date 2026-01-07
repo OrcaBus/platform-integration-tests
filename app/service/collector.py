@@ -26,6 +26,7 @@ import hashlib
 import json
 import os
 from datetime import datetime, timezone
+from typing import Optional
 
 import boto3
 
@@ -83,6 +84,34 @@ def _get_run_meta(test_run_id: str):
     return resp.get("Item")
 
 
+def _extract_instrument_run_id(obj: dict) -> Optional[str]:
+    """
+    Recursively search for instrumentRunId in nested dictionaries.
+    Returns the first instrumentRunId found, or None if not found.
+    """
+    if not isinstance(obj, dict):
+        return None
+
+    # Check if instrumentRunId exists at this level
+    if "instrumentRunId" in obj:
+        return obj["instrumentRunId"]
+
+    # Recursively search nested dictionaries
+    for value in obj.values():
+        if isinstance(value, dict):
+            result = _extract_instrument_run_id(value)
+            if result is not None:
+                return result
+        elif isinstance(value, list):
+            for item in value:
+                if isinstance(item, dict):
+                    result = _extract_instrument_run_id(item)
+                    if result is not None:
+                        return result
+
+    return None
+
+
 def handler(event, context):
     """
     EventBridge event shape (simplified):
@@ -97,7 +126,30 @@ def handler(event, context):
           ...
         },
         ...
-      }
+    }
+    Example EventBridge event:
+    {
+    "version": "0",
+    "id": "437de356-417b-82d6-3dec-15c85699c743",
+    "detail-type": "SequenceRunStateChange",
+    "source": "orcabus.sequencerunmanager",
+    "account": "455634345446",
+    "time": "2025-12-04T23:19:23Z",
+    "region": "ap-southeast-2",
+    "resources": [],
+    "detail": {
+        "id": "seq.01KBNTKGADBP60RAXD241TATDT",
+        "instrumentRunId": "251125_A01052_0001_IT001",
+        "runVolumeName": "bssh.testvolume.it001",
+        "runFolderPath": "",
+        "runDataUri": "gds://bssh.testvolume.it001",
+        "sampleSheetName": "sampleSheet_it_test.csv",
+        "startTime": "2025-11-25T01:59:30Z",
+        "endTime": null,
+        "status": "STARTED"
+        ......
+        }
+    }
     """
     print(f"[Collector] EventBridge event: {json.dumps(event)}")
 
@@ -108,6 +160,22 @@ def handler(event, context):
     if not test_run_id:
         print("[Collector] No testRunId in event.detail, ignoring.")
         return {"ignored": True, "reason": "no_testRunId"}
+
+    # Extract instrumentRunId from event detail (may be nested)
+    instrument_run_id = _extract_instrument_run_id(detail)
+
+    # Validate that instrumentRunId matches testRunId
+    if instrument_run_id and instrument_run_id != test_run_id:
+        print(
+            f"[Collector] instrumentRunId mismatch: instrumentRunId={instrument_run_id}, "
+            f"testRunId={test_run_id}, ignoring."
+        )
+        return {
+            "ignored": True,
+            "reason": "instrumentRunId_mismatch",
+            "testRunId": test_run_id,
+            "instrumentRunId": instrument_run_id,
+        }
 
     run_meta = _get_run_meta(test_run_id)
     if not run_meta:

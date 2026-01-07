@@ -162,32 +162,6 @@ pnpm cdk-stateful <command>
 
 This CDK project manages multiple stacks. The root stack (the only one that does not include `DeploymentPipeline` in its stack ID) is deployed in the toolchain account and sets up a CodePipeline for cross-environment deployments to `beta`, `gamma`, and `prod`.
 
-To list all available stateless stacks, run:
-
-```sh
-pnpm cdk-stateless ls
-```
-
-Example output:
-
-```sh
-StatelessPlatformItHarnessStack
-StatelessPlatformItHarnessStack/DeploymentPipeline/OrcaBusBeta/StatelessPlatformItHarnessStack (OrcaBusBeta-StatelessPlatformItHarnessStack)
-StatelessPlatformItHarnessStack/DeploymentPipeline/OrcaBusGamma/StatelessPlatformItHarnessStack (OrcaBusGamma-StatelessPlatformItHarnessStack)
-```
-
-To build the CICD pipeline for Integration Testing stateless service
-```sh
-pnpm cdk-stateless deploy -e StatelessPlatformItHarnessStack
-```
-
-To build (test) in the dev account
-```sh
-pnpm cdk-stateless synth -e StatelessPlatformItHarnessStack/DeploymentPipeline/OrcaBusBeta/StatelessPlatformItHarnessStack
-pnpm cdk-stateless diff -e StatelessPlatformItHarnessStack/DeploymentPipeline/OrcaBusBeta/StatelessPlatformItHarnessStack
-pnpm cdk-stateless deploy -e StatelessPlatformItHarnessStack/DeploymentPipeline/OrcaBusBeta/StatelessPlatformItHarnessStack
-```
-
 To list all available stateful stacks, run:
 
 ```sh
@@ -198,20 +172,49 @@ Example output:
 
 ```sh
 StatefulPlatformItStorageStack
-StatefulPlatformItStorageStack/DeploymentPipeline/OrcaBusBeta/StatefulPlatformItStorageStack (OrcaBusBeta-StatefulPlatformItStorageStack)
 StatefulPlatformItStorageStack/DeploymentPipeline/OrcaBusGamma/StatefulPlatformItStorageStack (OrcaBusGamma-StatefulPlatformItStorageStack)
 ```
 
 To build the CICD pipeline for Integration Testing stateful service
 ```sh
+pnpm cdk-stateful synth -e StatefulPlatformItStorageStack
+pnpm cdk-stateful diff -e StatefulPlatformItStorageStack
 pnpm cdk-stateful deploy -e StatefulPlatformItStorageStack
 ```
 
-To build (test) in the dev account
+To build (test) in the stg account
 ```sh
-pnpm cdk-stateful synth -e StatefulPlatformItStorageStack/DeploymentPipeline/OrcaBusBeta/StatefulPlatformItStorageStack
-pnpm cdk-stateful diff -e StatefulPlatformItStorageStack/DeploymentPipeline/OrcaBusBeta/StatefulPlatformItStorageStack
-pnpm cdk-stateful deploy -e StatefulPlatformItStorageStack/DeploymentPipeline/OrcaBusBeta/StatefulPlatformItStorageStack
+pnpm cdk-stateful synth -e StatefulPlatformItStorageStack/DeploymentPipeline/OrcaBusGamma/StatefulPlatformItStorageStack
+pnpm cdk-stateful diff -e StatefulPlatformItStorageStack/DeploymentPipeline/OrcaBusGamma/StatefulPlatformItStorageStack
+pnpm cdk-stateful deploy -e StatefulPlatformItStorageStack/DeploymentPipeline/OrcaBusGamma/StatefulPlatformItStorageStack
+```
+
+
+To list all available stateless stacks, run:
+
+```sh
+pnpm cdk-stateless ls
+```
+
+Example output:
+
+```sh
+StatelessPlatformItHarnessStack
+StatelessPlatformItHarnessStack/DeploymentPipeline/OrcaBusGamma/StatelessPlatformItHarnessStack (OrcaBusGamma-StatelessPlatformItHarnessStack)
+```
+
+To build the CICD pipeline for Integration Testing stateless service
+```sh
+pnpm cdk-stateless synth -e StatelessPlatformItHarnessStack
+pnpm cdk-stateless diff -e StatelessPlatformItHarnessStack
+pnpm cdk-stateless deploy -e StatelessPlatformItHarnessStack
+```
+
+To build (test) in the gamma account
+```sh
+pnpm cdk-stateless synth -e StatelessPlatformItHarnessStack/DeploymentPipeline/OrcaBusGamma/StatelessPlatformItHarnessStack
+pnpm cdk-stateless diff -e StatelessPlatformItHarnessStack/DeploymentPipeline/OrcaBusGamma/StatelessPlatformItHarnessStack
+pnpm cdk-stateless deploy -e StatelessPlatformItHarnessStack/DeploymentPipeline/OrcaBusGamma/StatelessPlatformItHarnessStack
 ```
 
 Development

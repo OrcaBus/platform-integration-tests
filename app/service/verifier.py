@@ -129,7 +129,9 @@ def _get_nested_value(obj: Dict[str, Any], path: str) -> Any:
 
 
 def _match_event(
-    expected: Dict[str, Any], observed_event_body: Dict[str, Any], match_fields: List[str]
+    expected: Dict[str, Any],
+    observed_event_body: Dict[str, Any],
+    match_fields: List[str],
 ) -> bool:
     """
     Match observed event against expected event using match fields.
@@ -170,7 +172,10 @@ def _find_matching_event(
             continue
 
         # Check if detailType and source match (they should from query, but double-check)
-        if event_body.get("detail-type") != detail_type or event_body.get("source") != source:
+        if (
+            event_body.get("detail-type") != detail_type
+            or event_body.get("source") != source
+        ):
             continue
 
         # Apply match rules
@@ -310,7 +315,9 @@ def _verify_mode(test_run_id: str) -> dict:
         match_fields = expected.get("__match", {}).get("fields", [])
 
         if not detail_type or not source:
-            print(f"[Verifier/Verify] Skipping expectation {idx}: missing detail-type or source")
+            print(
+                f"[Verifier/Verify] Skipping expectation {idx}: missing detail-type or source"
+            )
             continue
 
         # Query for matching observed events
@@ -366,9 +373,7 @@ def _verify_mode(test_run_id: str) -> dict:
                     f"[Verifier/Verify] Missing expectation {idx}: detailType={detail_type}, source={source}"
                 )
             except Exception as e:
-                print(
-                    f"[Verifier/Verify] Failed to write missing event item: {e}"
-                )
+                print(f"[Verifier/Verify] Failed to write missing event item: {e}")
 
     # Check for unexpected events (events not matched to any expectation)
     unexpected_count = 0
@@ -396,9 +401,7 @@ def _verify_mode(test_run_id: str) -> dict:
                         },
                     )
                 except Exception as e:
-                    print(
-                        f"[Verifier/Verify] Failed to mark event as unexpected: {e}"
-                    )
+                    print(f"[Verifier/Verify] Failed to mark event as unexpected: {e}")
     except Exception as e:
         print(f"[Verifier/Verify] Failed to check for unexpected events: {e}")
 
@@ -417,7 +420,10 @@ def _verify_mode(test_run_id: str) -> dict:
             Key={"testId": meta["testId"], "sk": meta["sk"]},
             UpdateExpression="SET #s = :status, verifiedAt = :verifiedAt",
             ExpressionAttributeNames={"#s": "status"},
-            ExpressionAttributeValues={":status": run_status, ":verifiedAt": verifier_at},
+            ExpressionAttributeValues={
+                ":status": run_status,
+                ":verifiedAt": verifier_at,
+            },
         )
     except Exception as e:
         print(f"[Verifier/Verify] Failed to update run meta status: {e}")
