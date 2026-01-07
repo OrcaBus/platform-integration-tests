@@ -202,7 +202,9 @@ def _format_events_table(events: List[Dict[str, Any]], event_type: str) -> str:
     elif event_type == "missing":
         html += "<th>Order</th><th>Detail Type</th><th>Source</th><th>Expected Event</th><th>Verifier At</th>"
     else:  # unexpected
-        html += "<th>Detail Type</th><th>Source</th><th>Event ID</th><th>Received At</th>"
+        html += (
+            "<th>Detail Type</th><th>Source</th><th>Event ID</th><th>Received At</th>"
+        )
     html += "</tr>"
 
     for event in events:

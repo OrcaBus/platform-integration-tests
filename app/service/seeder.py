@@ -111,6 +111,7 @@ def _load_service_seed_definitions(
         events = _load_s3_json_list(S3_BUCKET, events_key)
         return events, "all"
 
+
 def _publish_test_events(
     test_run_id: str,
     service_name: str,
@@ -140,13 +141,17 @@ def _publish_test_events(
     for idx, ev in enumerate(events_definitions):
         # Extract source and detail-type (handle both lowercase and capitalized)
         source = ev.get("source") or ev.get("Source")
-        detail_type = ev.get("detail-type") or ev.get("DetailType") or ev.get("detailType")
+        detail_type = (
+            ev.get("detail-type") or ev.get("DetailType") or ev.get("detailType")
+        )
 
         if not source:
             logger.error("Event %d missing 'source' or 'Source' field", idx + 1)
             raise ValueError(f"Event {idx + 1} must have a 'source' field")
         if not detail_type:
-            logger.error("Event %d missing 'detail-type' or 'DetailType' field", idx + 1)
+            logger.error(
+                "Event %d missing 'detail-type' or 'DetailType' field", idx + 1
+            )
             raise ValueError(f"Event {idx + 1} must have a 'detail-type' field")
 
         # Extract detail (handle both lowercase and capitalized)
@@ -232,8 +237,8 @@ def handler(event, context):
     )
 
     try:
-        events_defs, effective_service_name = (
-            _load_service_seed_definitions(requested_service_name)
+        events_defs, effective_service_name = _load_service_seed_definitions(
+            requested_service_name
         )
     except ClientError as e:
         logger.error(
