@@ -253,23 +253,49 @@ def _status_mode(test_run_id: str) -> dict:
             }
 
     # If all expected events observed -> ready
-    if observed_count >= expected_count and expected_count > 0:
-        if current_status != "ready":
-            try:
-                table.update_item(
-                    Key={"testId": meta["testId"], "sk": meta["sk"]},
-                    UpdateExpression="SET #s = :ready",
-                    ExpressionAttributeNames={"#s": "status"},
-                    ExpressionAttributeValues={":ready": "ready"},
-                )
-            except Exception as e:
-                print(f"[Verifier/Status] Failed to set run status to ready: {e}")
-        return {
-            "status": "ready",
-            "runId": test_run_id,
-            "observedCount": observed_count,
-            "expectedCount": expected_count,
-        }
+    # Note: If expected_count is 0, we still check if we have observed events
+    # This handles cases where expectations.json might be missing or empty
+    if expected_count > 0:
+        # Normal case: check if we've observed all expected events
+        if observed_count >= expected_count:
+            if current_status != "ready":
+                try:
+                    table.update_item(
+                        Key={"testId": meta["testId"], "sk": meta["sk"]},
+                        UpdateExpression="SET #s = :ready",
+                        ExpressionAttributeNames={"#s": "status"},
+                        ExpressionAttributeValues={":ready": "ready"},
+                    )
+                except Exception as e:
+                    print(f"[Verifier/Status] Failed to set run status to ready: {e}")
+            return {
+                "status": "ready",
+                "runId": test_run_id,
+                "observedCount": observed_count,
+                "expectedCount": expected_count,
+            }
+    else:
+        # Edge case: no expectations defined, but we have observed events
+        # Consider ready if we have at least some events (to avoid infinite loop)
+        # This is a fallback for when expectations.json is missing or empty
+        if observed_count > 0:
+            print(f"[Verifier/Status] No expectations defined (expected_count=0), but {observed_count} events observed. Marking as ready.")
+            if current_status != "ready":
+                try:
+                    table.update_item(
+                        Key={"testId": meta["testId"], "sk": meta["sk"]},
+                        UpdateExpression="SET #s = :ready",
+                        ExpressionAttributeNames={"#s": "status"},
+                        ExpressionAttributeValues={":ready": "ready"},
+                    )
+                except Exception as e:
+                    print(f"[Verifier/Status] Failed to set run status to ready: {e}")
+            return {
+                "status": "ready",
+                "runId": test_run_id,
+                "observedCount": observed_count,
+                "expectedCount": expected_count,
+            }
 
     # Otherwise still running
     return {
