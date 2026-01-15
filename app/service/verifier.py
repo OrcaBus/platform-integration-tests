@@ -279,7 +279,9 @@ def _status_mode(test_run_id: str) -> dict:
         # Consider ready if we have at least some events (to avoid infinite loop)
         # This is a fallback for when expectations.json is missing or empty
         if observed_count > 0:
-            print(f"[Verifier/Status] No expectations defined (expected_count=0), but {observed_count} events observed. Marking as ready.")
+            print(
+                f"[Verifier/Status] No expectations defined (expected_count=0), but {observed_count} events observed. Marking as ready."
+            )
             if current_status != "ready":
                 try:
                     table.update_item(
