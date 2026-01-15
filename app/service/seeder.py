@@ -387,7 +387,8 @@ def handler(event, context):
 
     now = datetime.now(tz=timezone.utc)
     started_at = _now_iso()
-    timeout_at = (now + timedelta(minutes=5)).isoformat(timespec="seconds") + "Z"
+    # Create timeout_at in ISO format ending with Z (UTC)
+    timeout_at = (now + timedelta(minutes=5)).strftime("%Y-%m-%dT%H:%M:%SZ")
 
     # 2. Create run meta item
     meta_item = {

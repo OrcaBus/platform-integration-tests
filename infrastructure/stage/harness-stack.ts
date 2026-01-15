@@ -270,9 +270,9 @@ export class IntegrationTestsHarnessStack extends Stack {
       resultPath: '$.status',
     });
 
-    // 4. Wait X seconds
+    // 4. Wait X seconds (reduced to 30 seconds for more frequent timeout checks)
     const waitX = new Wait(this, 'WaitForEvents', {
-      time: WaitTime.duration(Duration.minutes(1)),
+      time: WaitTime.duration(Duration.seconds(30)),
     });
 
     // 5. Verify: call Verifier in "verify" mode once ready/timeout
