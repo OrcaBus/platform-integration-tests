@@ -231,26 +231,44 @@ def _status_mode(test_run_id: str) -> dict:
     timeout_at_str = meta.get("timeoutAt")
     now = datetime.now(timezone.utc)
 
-    # Timeout check
+    print(
+        f"[Verifier/Status] Checking status for testRunId={test_run_id}, "
+        f"currentStatus={current_status}, observedCount={observed_count}, "
+        f"expectedCount={expected_count}, timeoutAt={timeout_at_str}, now={now.isoformat()}"
+    )
+
+    # Timeout check - must be done BEFORE checking if ready
+    # This ensures timeout is detected even if events haven't been collected
     if timeout_at_str:
         timeout_at = _parse_iso(timeout_at_str)
-        if timeout_at and now >= timeout_at:
-            if current_status != "timeout":
-                try:
-                    table.update_item(
-                        Key={"testId": meta["testId"], "sk": meta["sk"]},
-                        UpdateExpression="SET #s = :timeout",
-                        ExpressionAttributeNames={"#s": "status"},
-                        ExpressionAttributeValues={":timeout": "timeout"},
-                    )
-                except Exception as e:
-                    print(f"[Verifier/Status] Failed to set run status to timeout: {e}")
-            return {
-                "status": "timeout",
-                "runId": test_run_id,
-                "observedCount": observed_count,
-                "expectedCount": expected_count,
-            }
+        if timeout_at:
+            # Make timeout_at timezone-aware if it's naive
+            if timeout_at.tzinfo is None:
+                timeout_at = timeout_at.replace(tzinfo=timezone.utc)
+
+            if now >= timeout_at:
+                print(
+                    f"[Verifier/Status] Timeout detected: now={now.isoformat()}, timeoutAt={timeout_at.isoformat()}"
+                )
+                if current_status != "timeout":
+                    try:
+                        table.update_item(
+                            Key={"testId": meta["testId"], "sk": meta["sk"]},
+                            UpdateExpression="SET #s = :timeout",
+                            ExpressionAttributeNames={"#s": "status"},
+                            ExpressionAttributeValues={":timeout": "timeout"},
+                        )
+                        print(f"[Verifier/Status] Updated run status to timeout")
+                    except Exception as e:
+                        print(f"[Verifier/Status] Failed to set run status to timeout: {e}")
+                return {
+                    "status": "timeout",
+                    "runId": test_run_id,
+                    "observedCount": observed_count,
+                    "expectedCount": expected_count,
+                }
+        else:
+            print(f"[Verifier/Status] Failed to parse timeoutAt: {timeout_at_str}")
 
     # If all expected events observed -> ready
     # Note: If expected_count is 0, we still check if we have observed events
