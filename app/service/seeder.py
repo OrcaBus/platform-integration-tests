@@ -124,7 +124,9 @@ def _generate_dynamic_ids(test_run_id: str) -> Tuple[str, str, str]:
         - run_id: Format r.{uuid} where uuid is test_run_id without "it-" prefix
     """
     # Extract UUID from test_run_id (remove "it-" prefix)
-    uuid_str = test_run_id.replace("it-", "") if test_run_id.startswith("it-") else test_run_id
+    uuid_str = (
+        test_run_id.replace("it-", "") if test_run_id.startswith("it-") else test_run_id
+    )
 
     # Generate date in YYMMDD format
     today = datetime.now(tz=timezone.utc)
@@ -132,7 +134,9 @@ def _generate_dynamic_ids(test_run_id: str) -> Tuple[str, str, str]:
 
     # Generate deterministic counter from UUID (use first 4 hex chars, convert to int, mod 10000)
     # This gives us a range of 0001-9999
-    counter_hex = uuid_str[:4] if len(uuid_str) >= 4 else uuid_str + "0" * (4 - len(uuid_str))
+    counter_hex = (
+        uuid_str[:4] if len(uuid_str) >= 4 else uuid_str + "0" * (4 - len(uuid_str))
+    )
     counter_int = int(counter_hex, 16) % 10000
     counter_str = f"{counter_int:04d}"
 
@@ -157,7 +161,9 @@ def _deep_replace_in_dict(obj: Any, old_value: str, new_value: str) -> Any:
     Recursively replace all occurrences of old_value with new_value in a nested dict/list structure.
     """
     if isinstance(obj, dict):
-        return {k: _deep_replace_in_dict(v, old_value, new_value) for k, v in obj.items()}
+        return {
+            k: _deep_replace_in_dict(v, old_value, new_value) for k, v in obj.items()
+        }
     elif isinstance(obj, list):
         return [_deep_replace_in_dict(item, old_value, new_value) for item in obj]
     elif isinstance(obj, str):
@@ -244,8 +250,12 @@ def _publish_test_events(
                         if k == "id" and re.match(r"r\.it\d+", v):
                             result[k] = run_id
                         # Replace instrumentRunId/name patterns (date-based format)
-                        elif k in ("instrumentRunId", "name") and re.match(r"\d{6}_A\d+_\d{4}_IT\d+", v):
-                            result[k] = instrument_run_id if k == "instrumentRunId" else name
+                        elif k in ("instrumentRunId", "name") and re.match(
+                            r"\d{6}_A\d+_\d{4}_IT\d+", v
+                        ):
+                            result[k] = (
+                                instrument_run_id if k == "instrumentRunId" else name
+                            )
                         else:
                             result[k] = _replace_patterns_in_dict(v)
                     elif k == "apiUrl" and isinstance(v, str):
@@ -281,9 +291,7 @@ def _publish_test_events(
                 # Update apiUrl if it exists
                 if "apiUrl" in ica_event and isinstance(ica_event["apiUrl"], str):
                     ica_event["apiUrl"] = re.sub(
-                        r"/runs/r\.it\d+",
-                        f"/runs/{run_id}",
-                        ica_event["apiUrl"]
+                        r"/runs/r\.it\d+", f"/runs/{run_id}", ica_event["apiUrl"]
                     )
 
         # Inject test tracing fields if __injectTestId is True

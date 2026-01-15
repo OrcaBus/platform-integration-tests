@@ -16,6 +16,9 @@ fix:
 fix-all: fix
 	@(cd app && make fix)
 
+audit-fix:
+	@pnpm audit --fix
+
 install:
 	@pnpm install --frozen-lockfile
 

@@ -28,7 +28,7 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     }
     """
     logger.info(f"RuleController: event={event}")
-    serviceName = event.get("serviceName", 'all')
+    serviceName = event.get("serviceName", "all")
     action = event.get("action")
     if action not in ("enable", "disable"):
         raise ValueError(f"Unsupported action: {action!r}")
@@ -50,5 +50,5 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         "eventBusName": EVENT_BUS_NAME,
         "action": action,
         "status": "ok",
-        'serviceName': serviceName, # passed through from step functions
+        "serviceName": serviceName,  # passed through from step functions
     }

@@ -326,16 +326,17 @@ export class IntegrationTestsHarnessStack extends Stack {
       .when(Condition.stringEquals('$.status.status', 'ready'), verifyAndReportChain)
       .when(Condition.stringEquals('$.status.status', 'timeout'), verifyAndReportChain);
 
+    // Set checkRunStatusTask's next state ONCE (it can only have one next state)
+    // Both the initial check and the wait loop will route TO checkRunStatusTask
+    checkRunStatusTask.next(statusChoice);
+
     // Create the wait loop: wait -> check status -> choice (for when status is still "running")
     // This creates a cycle: statusChoice (running) -> waitX -> checkRunStatusTask -> statusChoice
-    const waitAndCheckLoop = waitX.next(checkRunStatusTask).next(statusChoice);
-    statusChoice.otherwise(waitAndCheckLoop);
-
-    // Initial check: check status immediately after seeding (no wait on first check)
-    // Flow: seed -> checkRunStatusTask -> statusChoice -> (ready/timeout: verify chain, running: wait loop)
-    const initialCheck = checkRunStatusTask.next(statusChoice);
+    waitX.next(checkRunStatusTask);
+    statusChoice.otherwise(waitX);
 
     // Main chain: enable rule -> seed -> check status immediately -> (if running: wait -> check again, else: verify -> report -> disable)
-    return enableRuleTask.next(seedScenarioTask).next(initialCheck);
+    // Flow: seed -> checkRunStatusTask -> statusChoice -> (ready/timeout: verify chain, running: waitX -> checkRunStatusTask -> statusChoice loop)
+    return enableRuleTask.next(seedScenarioTask).next(checkRunStatusTask);
   }
 }
