@@ -10,6 +10,7 @@ Seeder Lambda Function
 import os
 import json
 import logging
+import re
 from typing import Optional, List, Dict, Any, Tuple
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -112,6 +113,59 @@ def _load_service_seed_definitions(
         return events, "all"
 
 
+def _generate_dynamic_ids(test_run_id: str) -> Tuple[str, str, str]:
+    """
+    Generate dynamic instrumentRunId, name, and id for a test run.
+
+    Returns:
+        (instrument_run_id, name, run_id) tuple where:
+        - instrument_run_id: Format YYMMDD_A0105_XXXX_ITXXX (date + counter + IT suffix)
+        - name: Same as instrument_run_id
+        - run_id: Format r.{uuid} where uuid is test_run_id without "it-" prefix
+    """
+    # Extract UUID from test_run_id (remove "it-" prefix)
+    uuid_str = test_run_id.replace("it-", "") if test_run_id.startswith("it-") else test_run_id
+
+    # Generate date in YYMMDD format
+    today = datetime.now(tz=timezone.utc)
+    date_str = today.strftime("%y%m%d")
+
+    # Generate deterministic counter from UUID (use first 4 hex chars, convert to int, mod 10000)
+    # This gives us a range of 0001-9999
+    counter_hex = uuid_str[:4] if len(uuid_str) >= 4 else uuid_str + "0" * (4 - len(uuid_str))
+    counter_int = int(counter_hex, 16) % 10000
+    counter_str = f"{counter_int:04d}"
+
+    # Generate IT suffix from UUID (use next 3 hex chars, convert to int, mod 1000, add 1)
+    # This gives us a range of IT001-IT999
+    it_hex = uuid_str[4:7] if len(uuid_str) >= 7 else (uuid_str + "0" * 7)[4:7]
+    it_int = (int(it_hex, 16) % 999) + 1
+    it_str = f"IT{it_int:03d}"
+
+    # Format: YYMMDD_A0105_XXXX_ITXXX
+    instrument_run_id = f"{date_str}_A0105_{counter_str}_{it_str}"
+    name = instrument_run_id
+
+    # Format: r.{uuid}
+    run_id = f"r.{uuid_str}"
+
+    return instrument_run_id, name, run_id
+
+
+def _deep_replace_in_dict(obj: Any, old_value: str, new_value: str) -> Any:
+    """
+    Recursively replace all occurrences of old_value with new_value in a nested dict/list structure.
+    """
+    if isinstance(obj, dict):
+        return {k: _deep_replace_in_dict(v, old_value, new_value) for k, v in obj.items()}
+    elif isinstance(obj, list):
+        return [_deep_replace_in_dict(item, old_value, new_value) for item in obj]
+    elif isinstance(obj, str):
+        return obj.replace(old_value, new_value)
+    else:
+        return obj
+
+
 def _publish_test_events(
     test_run_id: str,
     service_name: str,
@@ -131,10 +185,25 @@ def _publish_test_events(
     }
 
     Supports both lowercase (new format) and capitalized (legacy) field names.
+
+    Dynamically replaces:
+    - instrumentRunId and name with date-based format (YYMMDD_A0105_XXXX_ITXXX)
+    - id with r.{uuid} format (where uuid is test_run_id without "it-" prefix)
+    - apiUrl to use the new id
     """
     if not events_definitions:
         logger.info("No events to publish for serviceName=%s", service_name)
         return 0
+
+    # Generate dynamic IDs for this test run
+    instrument_run_id, name, run_id = _generate_dynamic_ids(test_run_id)
+    logger.info(
+        "Generated dynamic IDs for testRunId=%s: instrumentRunId=%s, name=%s, id=%s",
+        test_run_id,
+        instrument_run_id,
+        name,
+        run_id,
+    )
 
     published_count = 0
 
@@ -161,13 +230,69 @@ def _publish_test_events(
         if not isinstance(detail, dict):
             detail = {"data": detail}
 
+        # Deep copy detail to avoid modifying the original
+        detail = json.loads(json.dumps(detail))
+
+        # Helper function to replace patterns in strings recursively
+        def _replace_patterns_in_dict(obj: Any) -> Any:
+            """Recursively replace r.itXXX patterns and instrumentRunId/name patterns."""
+            if isinstance(obj, dict):
+                result = {}
+                for k, v in obj.items():
+                    if k in ("id", "instrumentRunId", "name") and isinstance(v, str):
+                        # Replace r.itXXX patterns in id fields
+                        if k == "id" and re.match(r"r\.it\d+", v):
+                            result[k] = run_id
+                        # Replace instrumentRunId/name patterns (date-based format)
+                        elif k in ("instrumentRunId", "name") and re.match(r"\d{6}_A\d+_\d{4}_IT\d+", v):
+                            result[k] = instrument_run_id if k == "instrumentRunId" else name
+                        else:
+                            result[k] = _replace_patterns_in_dict(v)
+                    elif k == "apiUrl" and isinstance(v, str):
+                        # Replace /runs/r.itXXX patterns in URLs
+                        result[k] = re.sub(r"/runs/r\.it\d+", f"/runs/{run_id}", v)
+                    else:
+                        result[k] = _replace_patterns_in_dict(v)
+                return result
+            elif isinstance(obj, list):
+                return [_replace_patterns_in_dict(item) for item in obj]
+            elif isinstance(obj, str):
+                # Replace any remaining r.itXXX patterns in strings
+                obj = re.sub(r"r\.it\d+", run_id, obj)
+                # Replace any remaining instrumentRunId/name patterns
+                obj = re.sub(r"\d{6}_A\d+_\d{4}_IT\d+", instrument_run_id, obj)
+                # Replace URL patterns
+                obj = re.sub(r"/runs/r\.it\d+", f"/runs/{run_id}", obj)
+                return obj
+            else:
+                return obj
+
+        # Apply pattern replacements
+        detail = _replace_patterns_in_dict(detail)
+
+        # Explicitly update nested structures like detail["ica-event"] if they exist
+        # This ensures the fields are set even if they didn't exist before
+        if "ica-event" in detail:
+            ica_event = detail["ica-event"]
+            if isinstance(ica_event, dict):
+                ica_event["id"] = run_id
+                ica_event["instrumentRunId"] = instrument_run_id
+                ica_event["name"] = name
+                # Update apiUrl if it exists
+                if "apiUrl" in ica_event and isinstance(ica_event["apiUrl"], str):
+                    ica_event["apiUrl"] = re.sub(
+                        r"/runs/r\.it\d+",
+                        f"/runs/{run_id}",
+                        ica_event["apiUrl"]
+                    )
+
         # Inject test tracing fields if __injectTestId is True
         inject_test_id = ev.get("__injectTestId", False)
         if inject_test_id:
             detail.setdefault("testRunId", test_run_id)
             detail.setdefault("serviceName", service_name)
             detail.setdefault("testMode", True)
-            detail.setdefault("instrumentRunId", test_run_id)
+            detail.setdefault("instrumentRunId", instrument_run_id)
 
         entry = {
             "EventBusName": EVENT_BUS_NAME,

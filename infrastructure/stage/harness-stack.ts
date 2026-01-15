@@ -324,14 +324,18 @@ export class IntegrationTestsHarnessStack extends Stack {
     // Choice based on status.status
     const statusChoice = new Choice(this, 'RunReadyOrTimeout?')
       .when(Condition.stringEquals('$.status.status', 'ready'), verifyAndReportChain)
-      .when(Condition.stringEquals('$.status.status', 'timeout'), verifyAndReportChain)
-      // Otherwise, wait again
-      .otherwise(waitX);
+      .when(Condition.stringEquals('$.status.status', 'timeout'), verifyAndReportChain);
 
-    // Loop: wait -> check status -> (if ready/timeout: verify -> report -> disable, else: wait again)
-    const waitLoop = waitX.next(checkRunStatusTask).next(statusChoice);
+    // Create the wait loop: wait -> check status -> choice (for when status is still "running")
+    // This creates a cycle: statusChoice (running) -> waitX -> checkRunStatusTask -> statusChoice
+    const waitAndCheckLoop = waitX.next(checkRunStatusTask).next(statusChoice);
+    statusChoice.otherwise(waitAndCheckLoop);
 
-    // Main chain: enable rule -> seed -> loop
-    return enableRuleTask.next(seedScenarioTask).next(waitLoop);
+    // Initial check: check status immediately after seeding (no wait on first check)
+    // Flow: seed -> checkRunStatusTask -> statusChoice -> (ready/timeout: verify chain, running: wait loop)
+    const initialCheck = checkRunStatusTask.next(statusChoice);
+
+    // Main chain: enable rule -> seed -> check status immediately -> (if running: wait -> check again, else: verify -> report -> disable)
+    return enableRuleTask.next(seedScenarioTask).next(initialCheck);
   }
 }
