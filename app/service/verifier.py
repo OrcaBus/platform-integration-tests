@@ -16,12 +16,12 @@ Status mode (called repeatedly by Step Functions):
       }
 
 Verify mode (called once when ready/timeout):
-  - Loads expectations.json from S3
-  - For each expected event:
-    - Queries DynamoDB for matching events (testRunId, detailType, source)
-    - Downloads event body from S3 if found
-    - Applies match rules based on expectation.__match.fields
-    - Writes match info (status=matched, verifierAt) or missing info (status=missed)
+    - Loads expectations.json from S3
+    - For each expected event:
+      - Queries DynamoDB for matching events (testRunId, detailType, source)
+      - Downloads event body from S3 if found
+      - Applies match rules based on expectation.__match.fields
+      - Writes match info (status=matched, verifiedAt) or missing info (status=missed)
   - Checks event order
   - Checks for unexpected events (more events than expected)
   - Updates run meta status to passed/failed
@@ -260,7 +260,9 @@ def _status_mode(test_run_id: str) -> dict:
                         )
                         print(f"[Verifier/Status] Updated run status to timeout")
                     except Exception as e:
-                        print(f"[Verifier/Status] Failed to set run status to timeout: {e}")
+                        print(
+                            f"[Verifier/Status] Failed to set run status to timeout: {e}"
+                        )
                 return {
                     "status": "timeout",
                     "runId": test_run_id,
@@ -381,11 +383,11 @@ def _verify_mode(test_run_id: str) -> dict:
             try:
                 table.update_item(
                     Key=event_key,
-                    UpdateExpression="SET #s = :status, verifierAt = :verifierAt, expectedOrder = :order, expectedEvent = :expected",
+                    UpdateExpression="SET #s = :status, verifiedAt = :verifiedAt, expectedOrder = :order, expectedEvent = :expected",
                     ExpressionAttributeNames={"#s": "status"},
                     ExpressionAttributeValues={
                         ":status": "matched",
-                        ":verifierAt": verifier_at,
+                        ":verifiedAt": verifier_at,
                         ":order": idx,
                         ":expected": expected,
                     },
@@ -406,12 +408,11 @@ def _verify_mode(test_run_id: str) -> dict:
                 missing_item = {
                     "testId": f"run#{test_run_id}",
                     "sk": missing_sk,
-                    "testRunId": test_run_id,
                     "detailType": detail_type,
                     "source": source,
                     "expectedEvent": expected,
                     "status": "missed",
-                    "verifierAt": verifier_at,
+                    "verifiedAt": verifier_at,
                     "expectedOrder": idx,
                 }
                 table.put_item(Item=missing_item)
@@ -439,11 +440,11 @@ def _verify_mode(test_run_id: str) -> dict:
                 try:
                     table.update_item(
                         Key=event_key,
-                        UpdateExpression="SET #s = :status, verifierAt = :verifierAt",
+                        UpdateExpression="SET #s = :status, verifiedAt = :verifiedAt",
                         ExpressionAttributeNames={"#s": "status"},
                         ExpressionAttributeValues={
                             ":status": "unexpected",
-                            ":verifierAt": verifier_at,
+                            ":verifiedAt": verifier_at,
                         },
                     )
                 except Exception as e:
