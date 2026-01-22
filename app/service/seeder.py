@@ -381,16 +381,13 @@ def handler(event, context):
         )
         raise
 
-    published_count = _publish_test_events(
-        test_run_id, effective_service_name, events_defs
-    )
-
     now = datetime.now(tz=timezone.utc)
     started_at = _now_iso()
     # Create timeout_at in ISO format ending with Z (UTC)
     timeout_at = (now + timedelta(minutes=5)).strftime("%Y-%m-%dT%H:%M:%SZ")
 
-    # 2. Create run meta item
+    # 1. Create run meta item FIRST to ensure it exists before events are published
+    # This prevents the collector from ignoring events due to missing run meta
     meta_item = {
         "testId": f"run#{test_run_id}",
         "sk": "run#meta",
@@ -401,7 +398,12 @@ def handler(event, context):
         "timeoutAt": timeout_at,
     }
     table.put_item(Item=meta_item)
-    print(f"[Seeder] Created run meta for {test_run_id}")
+    logger.info(f"[Seeder] Created run meta for testRunId={test_run_id}")
+
+    # 2. Publish test events to EventBridge AFTER meta item is created
+    published_count = _publish_test_events(
+        test_run_id, effective_service_name, events_defs
+    )
 
     return {
         "testRunId": test_run_id,

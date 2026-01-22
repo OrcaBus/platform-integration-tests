@@ -80,8 +80,31 @@ def _store_event_payload(test_run_id: str, event_id: str, full_event: dict) -> s
 
 
 def _get_run_meta(test_run_id: str):
-    resp = table.get_item(Key={"testId": f"run#{test_run_id}", "sk": "run#meta"})
-    return resp.get("Item")
+    """
+    Get run meta from DynamoDB.
+
+    Returns the run meta item or None if not found.
+    """
+    test_id = f"run#{test_run_id}"
+    key = {"testId": test_id, "sk": "run#meta"}
+
+    try:
+        print(f"[Collector] Querying DynamoDB for testId={test_id}, sk=run#meta")
+        resp = table.get_item(Key=key)
+        item = resp.get("Item")
+
+        if item:
+            print(f"[Collector] Found run meta for testRunId={test_run_id}")
+        else:
+            print(f"[Collector] No item found in DynamoDB response for testId={test_id}, sk=run#meta")
+            # Log the full response for debugging
+            print(f"[Collector] DynamoDB response: {json.dumps(resp)}")
+
+        return item
+    except Exception as e:
+        print(f"[Collector] Error querying DynamoDB for testRunId={test_run_id}: {e}")
+        print(f"[Collector] Query key was: {json.dumps(key)}")
+        return None
 
 
 def _extract_test_run_id_from_id(detail: dict) -> Optional[str]:
@@ -94,19 +117,30 @@ def _extract_test_run_id_from_id(detail: dict) -> Optional[str]:
     Returns the test_run_id (e.g., "it-{uuid}") or None if not found.
     """
     if not isinstance(detail, dict):
+        print("[Collector] Detail is not a dict")
         return None
 
     # Check for ica-event.id
     ica_event = detail.get("ica-event")
-    if isinstance(ica_event, dict):
-        id_value = ica_event.get("id")
-        if isinstance(id_value, str) and id_value.startswith("r."):
-            # Extract UUID by removing "r." prefix
-            uuid_str = id_value[2:]  # Remove "r." prefix
-            # Reconstruct test_run_id by adding "it-" prefix
-            return f"it-{uuid_str}"
+    if not isinstance(ica_event, dict):
+        print(f"[Collector] ica-event not found or not a dict. Detail keys: {list(detail.keys())}")
+        return None
 
-    return None
+    id_value = ica_event.get("id")
+    if not isinstance(id_value, str):
+        print(f"[Collector] ica-event.id not found or not a string. ica-event keys: {list(ica_event.keys())}")
+        return None
+
+    if not id_value.startswith("r."):
+        print(f"[Collector] ica-event.id does not start with 'r.': {id_value}")
+        return None
+
+    # Extract UUID by removing "r." prefix
+    uuid_str = id_value[2:]  # Remove "r." prefix
+    # Reconstruct test_run_id by adding "it-" prefix
+    test_run_id = f"it-{uuid_str}"
+    print(f"[Collector] Extracted id={id_value}, uuid={uuid_str}, test_run_id={test_run_id}")
+    return test_run_id
 
 
 def handler(event, context):
@@ -160,10 +194,17 @@ def handler(event, context):
         print("[Collector] No ica-event.id found in event.detail, ignoring.")
         return {"ignored": True, "reason": "no_ica_event_id"}
 
+    print(f"[Collector] Extracted testRunId={test_run_id} from ica-event.id")
+
     run_meta = _get_run_meta(test_run_id)
     if not run_meta:
-        print(f"[Collector] No run meta found for testRunId={test_run_id}, ignoring.")
+        print(
+            f"[Collector] No run meta found for testRunId={test_run_id}, "
+            f"querying DynamoDB with testId=run#{test_run_id}, sk=run#meta. Ignoring event."
+        )
         return {"ignored": True, "reason": "no_run_meta", "testRunId": test_run_id}
+
+    print(f"[Collector] Successfully found run meta for testRunId={test_run_id}")
 
     event_id = event.get("id", "")
     detail_type = event.get("detail-type", "")
