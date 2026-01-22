@@ -15,7 +15,7 @@ from typing import Optional, List, Dict, Any, Tuple
 import uuid
 from datetime import datetime, timedelta, timezone
 import time
-
+import random
 import boto3
 from botocore.exceptions import ClientError
 
@@ -90,70 +90,29 @@ def _load_service_seed_definitions(
     If those keys don't exist, fall back to 'all'.
     Returns (events, effective_service_name).
     """
-    requested = service_name
-    events_key, _ = _s3_keys_for_service(requested)
+    requested_service_name = service_name
+    events_key, _ = _s3_keys_for_service(requested_service_name)
 
     try:
         events = _load_s3_json_list(S3_BUCKET, events_key)
-        logger.info("Loaded seeds for serviceName=%s", requested)
-        return events, requested
+        logger.info("Loaded seeds for serviceName=%s", requested_service_name)
+        return events, requested_service_name
     except ClientError as e:
         code = e.response.get("Error", {}).get("Code")
         if code not in ("NoSuchKey", "NoSuchBucket"):
-            logger.error("Error loading seeds for serviceName=%s: %s", requested, e)
+            logger.error(
+                "Error loading seeds for serviceName=%s: %s", requested_service_name, e
+            )
             raise
 
         # fall back to 'all'
         logger.warning(
             "Seed definitions for serviceName=%s not found, falling back to 'all'",
-            requested,
+            requested_service_name,
         )
         events_key, _ = _s3_keys_for_service("all")
         events = _load_s3_json_list(S3_BUCKET, events_key)
         return events, "all"
-
-
-def _generate_dynamic_ids(test_run_id: str) -> Tuple[str, str, str]:
-    """
-    Generate dynamic instrumentRunId, name, and id for a test run.
-
-    Returns:
-        (instrument_run_id, name, run_id) tuple where:
-        - instrument_run_id: Format YYMMDD_A0105_XXXX_ITXXX (date + counter + IT suffix)
-        - name: Same as instrument_run_id
-        - run_id: Format r.{uuid} where uuid is test_run_id without "it-" prefix
-    """
-    # Extract UUID from test_run_id (remove "it-" prefix)
-    uuid_str = (
-        test_run_id.replace("it-", "") if test_run_id.startswith("it-") else test_run_id
-    )
-
-    # Generate date in YYMMDD format
-    today = datetime.now(tz=timezone.utc)
-    date_str = today.strftime("%y%m%d")
-
-    # Generate deterministic counter from UUID (use first 4 hex chars, convert to int, mod 10000)
-    # This gives us a range of 0001-9999
-    counter_hex = (
-        uuid_str[:4] if len(uuid_str) >= 4 else uuid_str + "0" * (4 - len(uuid_str))
-    )
-    counter_int = int(counter_hex, 16) % 10000
-    counter_str = f"{counter_int:04d}"
-
-    # Generate IT suffix from UUID (use next 3 hex chars, convert to int, mod 1000, add 1)
-    # This gives us a range of IT001-IT999
-    it_hex = uuid_str[4:7] if len(uuid_str) >= 7 else (uuid_str + "0" * 7)[4:7]
-    it_int = (int(it_hex, 16) % 999) + 1
-    it_str = f"IT{it_int:03d}"
-
-    # Format: YYMMDD_A0105_XXXX_ITXXX
-    instrument_run_id = f"{date_str}_A0105_{counter_str}_{it_str}"
-    name = instrument_run_id
-
-    # Format: r.{uuid}
-    run_id = f"r.{uuid_str}"
-
-    return instrument_run_id, name, run_id
 
 
 def _deep_replace_in_dict(obj: Any, old_value: str, new_value: str) -> Any:
@@ -173,7 +132,7 @@ def _deep_replace_in_dict(obj: Any, old_value: str, new_value: str) -> Any:
 
 
 def _publish_test_events(
-    test_run_id: str,
+    instrument_run_id: str,
     service_name: str,
     events_definitions: List[Dict[str, Any]],
 ) -> int:
@@ -186,28 +145,25 @@ def _publish_test_events(
     {
       "source": "Pipe IcaEventPipeConstru-IntegrationTest",
       "detail-type": "Event from aws:sqs",
-      "detail": { ... arbitrary payload ... },
-      "__injectTestId": true  // optional, if true injects test tracing fields
+      "detail": { ... arbitrary payload ... }
     }
 
     Supports both lowercase (new format) and capitalized (legacy) field names.
 
     Dynamically replaces:
-    - instrumentRunId and name with date-based format (YYMMDD_A0105_XXXX_ITXXX)
-    - id with r.{uuid} format (where uuid is test_run_id without "it-" prefix)
-    - apiUrl to use the new id
+    - instrumentRunId and name with test_instrument_run_id format
+    - id with r.{uuid} format (uuid without "-")
+    - apiUrl to use the new id, but fake url
     """
     if not events_definitions:
         logger.info("No events to publish for serviceName=%s", service_name)
         return 0
 
     # Generate dynamic IDs for this test run
-    instrument_run_id, name, run_id = _generate_dynamic_ids(test_run_id)
+    run_id = f"r.{uuid.uuid4().replace('-', '')}"
     logger.info(
-        "Generated dynamic IDs for testRunId=%s: instrumentRunId=%s, name=%s, id=%s",
-        test_run_id,
+        "Generated dynamic IDs for instrumentRunId=%s, id=%s",
         instrument_run_id,
-        name,
         run_id,
     )
 
@@ -251,11 +207,9 @@ def _publish_test_events(
                             result[k] = run_id
                         # Replace instrumentRunId/name patterns (date-based format)
                         elif k in ("instrumentRunId", "name") and re.match(
-                            r"\d{6}_A\d+_\d{4}_IT\d+", v
+                            r"\d{6}_A\d+_\d{4}_TEST\d+", v
                         ):
-                            result[k] = (
-                                instrument_run_id if k == "instrumentRunId" else name
-                            )
+                            result[k] = instrument_run_id
                         else:
                             result[k] = _replace_patterns_in_dict(v)
                     elif k == "apiUrl" and isinstance(v, str):
@@ -267,13 +221,12 @@ def _publish_test_events(
             elif isinstance(obj, list):
                 return [_replace_patterns_in_dict(item) for item in obj]
             elif isinstance(obj, str):
-                # Replace any remaining r.itXXX patterns in strings
-                obj = re.sub(r"r\.it\d+", run_id, obj)
-                # Replace any remaining instrumentRunId/name patterns
-                obj = re.sub(r"\d{6}_A\d+_\d{4}_IT\d+", instrument_run_id, obj)
-                # Replace URL patterns
-                obj = re.sub(r"/runs/r\.it\d+", f"/runs/{run_id}", obj)
-                return obj
+                if re.match(r"r\.it\d+", obj):
+                    return obj.replace(r"r\.it\d+", run_id)
+                if re.match(r"\d{6}_A\d+_\d{4}_TEST\d+", obj):
+                    return obj.replace(r"\d{6}_A\d+_\d{4}_TEST\d+", instrument_run_id)
+                else:
+                    return obj
             else:
                 return obj
 
@@ -287,19 +240,13 @@ def _publish_test_events(
             if isinstance(ica_event, dict):
                 ica_event["id"] = run_id
                 ica_event["instrumentRunId"] = instrument_run_id
-                ica_event["name"] = name
+                ica_event["name"] = instrument_run_id
                 # Update apiUrl if it exists
                 if "apiUrl" in ica_event and isinstance(ica_event["apiUrl"], str):
                     ica_event["apiUrl"] = re.sub(
                         r"/runs/r\.it\d+", f"/runs/{run_id}", ica_event["apiUrl"]
                     )
 
-        # Inject test tracing fields if __injectTestId is True
-        inject_test_id = ev.get("__injectTestId", False)
-        if inject_test_id:
-            detail.setdefault("testRunId", test_run_id)
-            detail.setdefault("serviceName", service_name)
-            detail.setdefault("testMode", True)
             detail.setdefault("instrumentRunId", instrument_run_id)
 
         entry = {
@@ -310,10 +257,10 @@ def _publish_test_events(
         }
 
         logger.info(
-            "Publishing test event %d/%d for testRunId=%s, serviceName=%s (source=%s, detailType=%s)",
+            "Publishing test event %d/%d for instrumentRunId=%s, serviceName=%s (source=%s, detailType=%s)",
             idx + 1,
             len(events_definitions),
-            test_run_id,
+            instrument_run_id,
             service_name,
             source,
             detail_type,
@@ -334,12 +281,24 @@ def _publish_test_events(
             time.sleep(1)
 
     logger.info(
-        "Published %d test events to EventBridge for testRunId=%s, serviceName=%s",
+        "Published %d test events to EventBridge for instrumentRunId=%s, serviceName=%s",
         published_count,
-        test_run_id,
+        instrument_run_id,
         service_name,
     )
     return published_count
+
+
+def _generate_test_instrument_run_id() -> str:
+    """
+    Generate a test run id (instrumentRunId) in the format
+    date in format YYMMDD_A00001_XXXX_TESTXXXXXX
+    X will be randomly generated from 0001 to 9999 in string format
+    """
+    # Generate random number from 0001 to 9999
+    random_number_str_4digits = random.randint(1, 9999)
+    random_number_str_6digits = random.randint(1, 999999)
+    return f"{datetime.now(tz=timezone.utc).strftime('%y%m%d')}_A00001_{random_number_str_4digits:04d}_TEST{random_number_str_6digits:06d}"
 
 
 def handler(event, context):
@@ -357,14 +316,14 @@ def handler(event, context):
     """
     print(f"[Seeder] Event: {json.dumps(event)}")
 
-    # You can also derive testRunId from event if you prefer something deterministic
-    test_run_id = f"it-{uuid.uuid4()}"
+    # we
+    test_instrument_run_id = _generate_test_instrument_run_id()
     raw_service_name = event.get("serviceName")
     requested_service_name = _resolve_service_name(raw_service_name)
 
     logger.info(
-        "Starting seeding for testRunId=%s, requestedServiceName=%s (raw=%r)",
-        test_run_id,
+        "Starting seeding for testInstrumentRunId=%s, requestedServiceName=%s (raw=%r)",
+        test_instrument_run_id,
         requested_service_name,
         raw_service_name,
     )
@@ -389,7 +348,7 @@ def handler(event, context):
     # 1. Create run meta item FIRST to ensure it exists before events are published
     # This prevents the collector from ignoring events due to missing run meta
     meta_item = {
-        "testId": f"run#{test_run_id}",
+        "testId": f"run#{test_instrument_run_id}",
         "sk": "run#meta",
         "serviceName": effective_service_name,
         "observedCount": 0,
@@ -398,16 +357,19 @@ def handler(event, context):
         "timeoutAt": timeout_at,
     }
     table.put_item(Item=meta_item)
-    logger.info(f"[Seeder] Created run meta for testRunId={test_run_id}")
+    logger.info(
+        f"[Seeder] Created run meta for testInstrumentRunId={test_instrument_run_id}"
+    )
 
     # 2. Publish test events to EventBridge AFTER meta item is created
     published_count = _publish_test_events(
-        test_run_id, effective_service_name, events_defs
+        test_instrument_run_id, effective_service_name, events_defs
     )
 
     return {
-        "testRunId": test_run_id,
+        "testInstrumentRunId": test_instrument_run_id,
         "serviceName": effective_service_name,
         "startedAt": started_at,
         "timeoutAt": timeout_at,
+        "publishedCount": published_count,
     }

@@ -4,7 +4,7 @@ Reporter Lambda:
 
 - Input (from Step Functions):
   {
-    "testRunId": "...",  # or "runId"
+    "testInstrumentRunId": "...",  # or "testRunId" or "runId" for backward compatibility
     "serviceName": "...",
     "verifyResult": { ... },  # output of the Verifier
     ...
@@ -17,6 +17,8 @@ Reporter Lambda:
   - Stores it in S3.
   - Updates run meta with reportS3Key.
   - Returns report key (and basic summary).
+
+Note: testInstrumentRunId format is "YYMMDD_A00001_XXXX_TESTXXXXXX" (e.g., "260122_A00001_1234_TEST123456")
 """
 
 import json
@@ -75,7 +77,7 @@ def _load_template() -> str:
         return """
         <html>
           <head>
-            <title>Integration Test Report - {{ testRunId }}</title>
+            <title>Integration Test Report - {{ testInstrumentRunId }}</title>
             <style>
               body { font-family: Arial, sans-serif; margin: 20px; }
               .status-passed { color: green; font-weight: bold; }
@@ -88,7 +90,7 @@ def _load_template() -> str:
           </head>
           <body>
             <h1>Integration Test Report</h1>
-            <p><strong>Test Run ID:</strong> {{ testRunId }}</p>
+            <p><strong>Test Instrument Run ID:</strong> {{ testInstrumentRunId }}</p>
             <p><strong>Service:</strong> {{ serviceName }}</p>
             <p><strong>Status:</strong> <span class="status-{{ runStatus }}">{{ runStatus }}</span></p>
             <p><strong>Started At:</strong> {{ startedAt }}</p>
@@ -134,17 +136,29 @@ def _render_template(template: str, context: Dict[str, Any]) -> str:
     return html
 
 
-def _get_run_meta(test_run_id: str) -> Dict[str, Any]:
-    """Get run meta from DynamoDB."""
-    resp = table.get_item(Key={"testId": f"run#{test_run_id}", "sk": "run#meta"})
+def _get_run_meta(test_instrument_run_id: str) -> Dict[str, Any]:
+    """
+    Get run meta from DynamoDB.
+
+    Args:
+        test_instrument_run_id: The test instrument run ID (format: "YYMMDD_A00001_XXXX_TESTXXXXXX")
+    """
+    resp = table.get_item(
+        Key={"testId": f"run#{test_instrument_run_id}", "sk": "run#meta"}
+    )
     return resp.get("Item", {})
 
 
-def _get_matched_events(test_run_id: str) -> List[Dict[str, Any]]:
-    """Get all matched events (status=matched) for this run."""
+def _get_matched_events(test_instrument_run_id: str) -> List[Dict[str, Any]]:
+    """
+    Get all matched events (status=matched) for this run.
+
+    Args:
+        test_instrument_run_id: The test instrument run ID (format: "YYMMDD_A00001_XXXX_TESTXXXXXX")
+    """
     try:
         resp = table.query(
-            KeyConditionExpression=Key("testId").eq(f"run#{test_run_id}")
+            KeyConditionExpression=Key("testId").eq(f"run#{test_instrument_run_id}")
             & Key("sk").begins_with("event#"),
             FilterExpression=Attr("status").eq("matched"),
         )
@@ -157,11 +171,16 @@ def _get_matched_events(test_run_id: str) -> List[Dict[str, Any]]:
         return []
 
 
-def _get_missing_events(test_run_id: str) -> List[Dict[str, Any]]:
-    """Get all missing events (expectation#*-missing) for this run."""
+def _get_missing_events(test_instrument_run_id: str) -> List[Dict[str, Any]]:
+    """
+    Get all missing events (expectation#*-missing) for this run.
+
+    Args:
+        test_instrument_run_id: The test instrument run ID (format: "YYMMDD_A00001_XXXX_TESTXXXXXX")
+    """
     try:
         resp = table.query(
-            KeyConditionExpression=Key("testId").eq(f"run#{test_run_id}")
+            KeyConditionExpression=Key("testId").eq(f"run#{test_instrument_run_id}")
             & Key("sk").begins_with("expectation#"),
             FilterExpression=Attr("status").eq("missed"),
         )
@@ -174,11 +193,16 @@ def _get_missing_events(test_run_id: str) -> List[Dict[str, Any]]:
         return []
 
 
-def _get_unexpected_events(test_run_id: str) -> List[Dict[str, Any]]:
-    """Get all unexpected events (status=unexpected) for this run."""
+def _get_unexpected_events(test_instrument_run_id: str) -> List[Dict[str, Any]]:
+    """
+    Get all unexpected events (status=unexpected) for this run.
+
+    Args:
+        test_instrument_run_id: The test instrument run ID (format: "YYMMDD_A00001_XXXX_TESTXXXXXX")
+    """
     try:
         resp = table.query(
-            KeyConditionExpression=Key("testId").eq(f"run#{test_run_id}")
+            KeyConditionExpression=Key("testId").eq(f"run#{test_instrument_run_id}")
             & Key("sk").begins_with("event#"),
             FilterExpression=Attr("status").eq("unexpected"),
         )
@@ -239,27 +263,34 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     Input (from Step Functions ReportRun task):
 
       {
-        "testRunId": "...",  # or "runId"
+        "testInstrumentRunId": "...",  # or "testRunId" or "runId" for backward compatibility
         "serviceName": "workflowrunmanager",
         "verifyResult": { ... }
       }
+
+    Note: The Step Functions now passes testInstrumentRunId from seedResult.
     """
-    test_run_id = event.get("testRunId") or event.get("runId")
-    if not test_run_id:
-        raise ValueError("testRunId or runId is required")
+    # Extract test instrument run ID from various possible field names
+    # Priority: testInstrumentRunId > testRunId > runId
+    test_instrument_run_id = (
+        event.get("testInstrumentRunId") or event.get("testRunId") or event.get("runId")
+    )
+
+    if not test_instrument_run_id:
+        raise ValueError("testInstrumentRunId, testRunId, or runId is required")
 
     verify_result = event.get("verifyResult", {})
 
     # Load run meta to get additional details
-    run_meta = _get_run_meta(test_run_id)
+    run_meta = _get_run_meta(test_instrument_run_id)
     service_name = run_meta.get("serviceName") or event.get("serviceName", "all")
     started_at = run_meta.get("startedAt", "")
     verified_at = run_meta.get("verifiedAt", "")
 
     # Get detailed event information from DynamoDB
-    matched_events = _get_matched_events(test_run_id)
-    missing_events = _get_missing_events(test_run_id)
-    unexpected_events = _get_unexpected_events(test_run_id)
+    matched_events = _get_matched_events(test_instrument_run_id)
+    missing_events = _get_missing_events(test_instrument_run_id)
+    unexpected_events = _get_unexpected_events(test_instrument_run_id)
 
     now = datetime.now(timezone.utc)
     ts_for_filename = _safe_timestamp_filename(now)
@@ -267,16 +298,16 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     mm = now.strftime("%m")
     dd = now.strftime("%d")
 
-    # reports/testruns/{serviceName}/{YYYY}/{MM}/{DD}/{timestamp}-{testRunId}.html
+    # reports/testruns/{serviceName}/{YYYY}/{MM}/{DD}/{timestamp}-{testInstrumentRunId}.html
     key = (
         f"reports/testruns/{service_name}/"
         f"{yyyy}/{mm}/{dd}/"
-        f"{ts_for_filename}-{test_run_id}.html"
+        f"{ts_for_filename}-{test_instrument_run_id}.html"
     )
 
     logger.info(
-        "Generating report for testRunId=%s, serviceName=%s -> s3://%s/%s",
-        test_run_id,
+        "Generating report for testInstrumentRunId=%s, serviceName=%s -> s3://%s/%s",
+        test_instrument_run_id,
         service_name,
         S3_BUCKET,
         key,
@@ -296,7 +327,8 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     total_expected = verify_result.get("totalExpected", 0)
 
     context = {
-        "testRunId": test_run_id,
+        "testInstrumentRunId": test_instrument_run_id,
+        "testRunId": test_instrument_run_id,  # Keep for backward compatibility with template
         "serviceName": service_name,
         "runStatus": run_status,
         "startedAt": started_at,
@@ -324,7 +356,7 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     # Update run meta with reportS3Key
     try:
         table.update_item(
-            Key={"testId": f"run#{test_run_id}", "sk": "run#meta"},
+            Key={"testId": f"run#{test_instrument_run_id}", "sk": "run#meta"},
             UpdateExpression="SET reportS3Key = :key",
             ExpressionAttributeValues={":key": key},
         )

@@ -6,11 +6,11 @@ Verifier Lambda Function
 Two modes:
 
 Status mode (called repeatedly by Step Functions):
-  - Input: { "runId": "...", "mode": "status" } or { "testRunId": "...", "mode": "status" }
+  - Input: { "testInstrumentRunId": "...", "mode": "status" } or { "testRunId": "...", "mode": "status" } or { "runId": "...", "mode": "status" }
   - Checks run meta and returns:
       {
         "status": "running|ready|timeout|unknown",
-        "runId": "...",
+        "runId": "...",  # testInstrumentRunId value
         "observedCount": N,
         "expectedCount": N
       }
@@ -18,13 +18,15 @@ Status mode (called repeatedly by Step Functions):
 Verify mode (called once when ready/timeout):
     - Loads expectations.json from S3
     - For each expected event:
-      - Queries DynamoDB for matching events (testRunId, detailType, source)
+      - Queries DynamoDB for matching events (testInstrumentRunId, detailType, source)
       - Downloads event body from S3 if found
       - Applies match rules based on expectation.__match.fields
       - Writes match info (status=matched, verifiedAt) or missing info (status=missed)
   - Checks event order
   - Checks for unexpected events (more events than expected)
   - Updates run meta status to passed/failed
+
+Note: testInstrumentRunId format is "YYMMDD_A00001_XXXX_TESTXXXXXX" (e.g., "260122_A00001_1234_TEST123456")
 """
 
 import json
@@ -32,7 +34,7 @@ import os
 from collections import Counter
 from datetime import datetime, timezone
 from typing import Dict, Any, List, Optional
-
+import logging
 import boto3
 from boto3.dynamodb.conditions import Key, Attr
 from botocore.exceptions import ClientError
@@ -43,6 +45,9 @@ S3_BUCKET = os.environ["S3_BUCKET"]
 dynamodb = boto3.resource("dynamodb")
 table = dynamodb.Table(TABLE_NAME)
 s3_client = boto3.client("s3")
+
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
 
 
 def _now_iso() -> str:
@@ -58,9 +63,29 @@ def _parse_iso(dt_str: str):
         return None
 
 
-def _get_run_meta(test_run_id: str):
-    resp = table.get_item(Key={"testId": f"run#{test_run_id}", "sk": "run#meta"})
-    return resp.get("Item")
+def _get_run_meta(test_instrument_run_id: str):
+    """
+    Get run meta from DynamoDB.
+
+    Args:
+        test_instrument_run_id: The test instrument run ID (format: "YYMMDD_A00001_XXXX_TESTXXXXXX")
+
+    Returns:
+        The run meta item or None if not found.
+    """
+    resp = table.get_item(
+        Key={"testId": f"run#{test_instrument_run_id}", "sk": "run#meta"}
+    )
+    item = resp.get("Item")
+    if item:
+        logger.info(
+            f"[Verifier] Successfully found run meta for testInstrumentRunId={test_instrument_run_id}"
+        )
+    else:
+        logger.error(
+            f"[Verifier] No run meta found for testInstrumentRunId={test_instrument_run_id}"
+        )
+    return item
 
 
 def _load_s3_json_list(bucket: str, key: str) -> List[Dict[str, Any]]:
@@ -79,15 +104,20 @@ def _load_s3_json_list(bucket: str, key: str) -> List[Dict[str, Any]]:
 
 
 def _get_observed_events(
-    test_run_id: str, detail_type: str, source: str
+    test_instrument_run_id: str, detail_type: str, source: str
 ) -> List[Dict[str, Any]]:
     """
-    Query DynamoDB for observed events matching testRunId, detailType, and source.
+    Query DynamoDB for observed events matching testInstrumentRunId, detailType, and source.
     Returns list of event metadata items (with rawS3Key).
+
+    Args:
+        test_instrument_run_id: The test instrument run ID (format: "YYMMDD_A00001_XXXX_TESTXXXXXX")
+        detail_type: The event detail type
+        source: The event source
     """
     try:
         resp = table.query(
-            KeyConditionExpression=Key("testId").eq(f"run#{test_run_id}")
+            KeyConditionExpression=Key("testId").eq(f"run#{test_instrument_run_id}")
             & Key("sk").begins_with("event#"),
             FilterExpression=Attr("detailType").eq(detail_type)
             & Attr("source").eq(source),
@@ -188,22 +218,27 @@ def _find_matching_event(
 # ---------- STATUS MODE ----------
 
 
-def _status_mode(test_run_id: str) -> dict:
+def _status_mode(test_instrument_run_id: str) -> dict:
     """
     Used by Step Functions "CheckRunStatus".
+
+    Args:
+        test_instrument_run_id: The test instrument run ID (format: "YYMMDD_A00001_XXXX_TESTXXXXXX")
 
     Returns:
       {
         "status": "running|ready|timeout|unknown",
-        "runId": "...",
+        "runId": "...",  # testInstrumentRunId value
         "observedCount": N,
         "expectedCount": N
       }
     """
-    meta = _get_run_meta(test_run_id)
+    meta = _get_run_meta(test_instrument_run_id)
     if not meta:
-        print(f"[Verifier/Status] No run meta found for testRunId={test_run_id}")
-        return {"status": "unknown", "runId": test_run_id}
+        print(
+            f"[Verifier/Status] No run meta found for testInstrumentRunId={test_instrument_run_id}"
+        )
+        return {"status": "unknown", "runId": test_instrument_run_id}
 
     service_name = meta.get("serviceName", "all")
     expected_count = 0
@@ -219,7 +254,7 @@ def _status_mode(test_run_id: str) -> dict:
     # Count observed events
     try:
         resp = table.query(
-            KeyConditionExpression=Key("testId").eq(f"run#{test_run_id}")
+            KeyConditionExpression=Key("testId").eq(f"run#{test_instrument_run_id}")
             & Key("sk").begins_with("event#")
         )
         observed_count = len(resp.get("Items", []))
@@ -232,7 +267,7 @@ def _status_mode(test_run_id: str) -> dict:
     now = datetime.now(timezone.utc)
 
     print(
-        f"[Verifier/Status] Checking status for testRunId={test_run_id}, "
+        f"[Verifier/Status] Checking status for testInstrumentRunId={test_instrument_run_id}, "
         f"currentStatus={current_status}, observedCount={observed_count}, "
         f"expectedCount={expected_count}, timeoutAt={timeout_at_str}, now={now.isoformat()}"
     )
@@ -265,7 +300,7 @@ def _status_mode(test_run_id: str) -> dict:
                         )
                 return {
                     "status": "timeout",
-                    "runId": test_run_id,
+                    "runId": test_instrument_run_id,
                     "observedCount": observed_count,
                     "expectedCount": expected_count,
                 }
@@ -290,7 +325,7 @@ def _status_mode(test_run_id: str) -> dict:
                     print(f"[Verifier/Status] Failed to set run status to ready: {e}")
             return {
                 "status": "ready",
-                "runId": test_run_id,
+                "runId": test_instrument_run_id,
                 "observedCount": observed_count,
                 "expectedCount": expected_count,
             }
@@ -314,7 +349,7 @@ def _status_mode(test_run_id: str) -> dict:
                     print(f"[Verifier/Status] Failed to set run status to ready: {e}")
             return {
                 "status": "ready",
-                "runId": test_run_id,
+                "runId": test_instrument_run_id,
                 "observedCount": observed_count,
                 "expectedCount": expected_count,
             }
@@ -322,7 +357,7 @@ def _status_mode(test_run_id: str) -> dict:
     # Otherwise still running
     return {
         "status": "running",
-        "runId": test_run_id,
+        "runId": test_instrument_run_id,
         "observedCount": observed_count,
         "expectedCount": expected_count,
     }
@@ -331,13 +366,18 @@ def _status_mode(test_run_id: str) -> dict:
 # ---------- VERIFY MODE ----------
 
 
-def _verify_mode(test_run_id: str) -> dict:
+def _verify_mode(test_instrument_run_id: str) -> dict:
     """
     Verify mode: Load expectations, match against observed events, write results.
+
+    Args:
+        test_instrument_run_id: The test instrument run ID (format: "YYMMDD_A00001_XXXX_TESTXXXXXX")
     """
-    meta = _get_run_meta(test_run_id)
+    meta = _get_run_meta(test_instrument_run_id)
     if not meta:
-        raise ValueError(f"No run meta found for testRunId={test_run_id}")
+        raise ValueError(
+            f"No run meta found for testInstrumentRunId={test_instrument_run_id}"
+        )
 
     service_name = meta.get("serviceName", "all")
     expectations_key = f"seed/services/{service_name}/expectations.json"
@@ -369,7 +409,9 @@ def _verify_mode(test_run_id: str) -> dict:
             continue
 
         # Query for matching observed events
-        observed_events = _get_observed_events(test_run_id, detail_type, source)
+        observed_events = _get_observed_events(
+            test_instrument_run_id, detail_type, source
+        )
 
         # Find matching event
         matched_event = _find_matching_event(expected, observed_events, match_fields)
@@ -406,7 +448,7 @@ def _verify_mode(test_run_id: str) -> dict:
 
             try:
                 missing_item = {
-                    "testId": f"run#{test_run_id}",
+                    "testId": f"run#{test_instrument_run_id}",
                     "sk": missing_sk,
                     "detailType": detail_type,
                     "source": source,
@@ -426,7 +468,7 @@ def _verify_mode(test_run_id: str) -> dict:
     unexpected_count = 0
     try:
         resp = table.query(
-            KeyConditionExpression=Key("testId").eq(f"run#{test_run_id}")
+            KeyConditionExpression=Key("testId").eq(f"run#{test_instrument_run_id}")
             & Key("sk").begins_with("event#")
         )
         all_observed_events = resp.get("Items", [])
@@ -480,7 +522,7 @@ def _verify_mode(test_run_id: str) -> dict:
     )
 
     return {
-        "runId": test_run_id,
+        "runId": test_instrument_run_id,
         "runStatus": run_status,
         "matchedCount": matched_count,
         "missingCount": missing_count,
@@ -497,30 +539,43 @@ def handler(event, context):
     Mode selection:
 
     - Status mode (called by SFN loop):
-      { "runId": "...", "mode": "status" }
+      { "testInstrumentRunId": "...", "mode": "status" }
       or
       { "testRunId": "...", "mode": "status" }
+      or
+      { "runId": "...", "mode": "status" }
 
     - Verify mode (called by SFN after ready/timeout):
-      { "runId": "...", "mode": "verify" }
+      { "testInstrumentRunId": "...", "mode": "verify" }
       or
       { "testRunId": "...", "mode": "verify" }
+      or
+      { "runId": "...", "mode": "verify" }
+
+    Note: The seeder now returns testInstrumentRunId in seedResult.
     """
     print(f"[Verifier] Event: {json.dumps(event)}")
 
     mode = event.get("mode") or "verify"
 
-    test_run_id = (
-        event.get("runId")
+    # Extract test instrument run ID from various possible field names
+    # Priority: testInstrumentRunId > testRunId > runId
+    # Also check seedResult for backward compatibility
+    test_instrument_run_id = (
+        event.get("testInstrumentRunId")
         or event.get("testRunId")
-        or (event.get("seedResult") or {}).get("runId")
+        or event.get("runId")
+        or (event.get("seedResult") or {}).get("testInstrumentRunId")
         or (event.get("seedResult") or {}).get("testRunId")
+        or (event.get("seedResult") or {}).get("runId")
     )
 
-    if not test_run_id:
-        raise ValueError("runId or testRunId is required for verifier")
+    if not test_instrument_run_id:
+        raise ValueError(
+            "testInstrumentRunId, testRunId, or runId is required for verifier"
+        )
 
     if mode == "status":
-        return _status_mode(test_run_id)
+        return _status_mode(test_instrument_run_id)
     else:
-        return _verify_mode(test_run_id)
+        return _verify_mode(test_instrument_run_id)

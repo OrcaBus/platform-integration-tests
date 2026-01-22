@@ -242,26 +242,27 @@ export class IntegrationTestsHarnessStack extends Stack {
       lambdaFunction: ruleController,
       payload: TaskInput.fromObject({
         action: 'enable',
+        serviceName: JsonPath.stringAt('$.serviceName'),
       }),
     });
 
-    // 2. SeedScenario: Seeder will create testRunId + meta + slot items, and emit seed events.
-    // Seeder is responsible for generating and returning `testRunId`.
+    // 2. SeedScenario: Seeder will create testInstrumentRunId + meta + slot items, and emit seed events.
+    // Seeder is responsible for generating and returning `testInstrumentRunId`.
     const seedScenarioTask = new LambdaInvoke(this, 'SeedScenario', {
       lambdaFunction: seeder,
       payloadResponseOnly: true,
-      // Seeder returns { testRunId, scenario, expectedSlots, ... }
+      // Seeder returns { testInstrumentRunId, serviceName, startedAt, timeoutAt, publishedCount }
       // We store that under $.seedResult
       resultPath: '$.seedResult',
     });
 
     // 3. CheckRunStatus: call Verifier in "status" mode
     // Input to verifier:
-    //   { "testRunId": <from seedResult>, "mode": "status" }
+    //   { "testInstrumentRunId": <from seedResult>, "mode": "status" }
     const checkRunStatusTask = new LambdaInvoke(this, 'CheckRunStatus', {
       lambdaFunction: verifier,
       payload: TaskInput.fromObject({
-        testRunId: JsonPath.stringAt('$.seedResult.testRunId'),
+        testInstrumentRunId: JsonPath.stringAt('$.seedResult.testInstrumentRunId'),
         mode: 'status',
       }),
       payloadResponseOnly: true,
@@ -279,7 +280,7 @@ export class IntegrationTestsHarnessStack extends Stack {
     const verifyTask = new LambdaInvoke(this, 'VerifyRun', {
       lambdaFunction: verifier,
       payload: TaskInput.fromObject({
-        testRunId: JsonPath.stringAt('$.seedResult.testRunId'),
+        testInstrumentRunId: JsonPath.stringAt('$.seedResult.testInstrumentRunId'),
         mode: 'verify',
       }),
       payloadResponseOnly: true,
@@ -291,7 +292,7 @@ export class IntegrationTestsHarnessStack extends Stack {
     const reportTask = new LambdaInvoke(this, 'ReportRun', {
       lambdaFunction: reporter,
       payload: TaskInput.fromObject({
-        testRunId: JsonPath.stringAt('$.seedResult.testRunId'),
+        testInstrumentRunId: JsonPath.stringAt('$.seedResult.testInstrumentRunId'),
         verifyResult: JsonPath.stringAt('$.verifyResult'),
         // safe if you always document that callers pass serviceName or Seeder sets it in seedResult
         serviceName: JsonPath.stringAt('$.seedResult.serviceName'),

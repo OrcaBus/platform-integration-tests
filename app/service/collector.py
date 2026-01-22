@@ -6,15 +6,15 @@ Triggered by EventBridge rule.
 
 EventBridge sends events that include:
 
-  detail.ica-event.id  (string, format: "r.{uuid}" - required for test runs)
+  detail.ica-event.instrumentRunId  (string, format: "YYMMDD_A00001_XXXX_TESTXXXXXX" - required for test runs)
 
 Collector:
-  - Extracts test_run_id from detail.ica-event.id by removing "r." prefix and adding "it-" prefix.
-  - Ignores events without detail.ica-event.id (not part of an integration test run).
+  - Extracts test_instrument_run_id from detail.ica-event.instrumentRunId.
+  - Ignores events without detail.ica-event.instrumentRunId (not part of an integration test run).
   - Loads run meta (run#meta) to ensure the run exists.
   - Stores the full EventBridge event into S3 using a time-based path.
   - Writes observed event record to DynamoDB with:
-    - pk: run#{testRunId}
+    - pk: run#{testInstrumentRunId}
     - sk: event#{timestamp}-{eventId}
     - detailType, source, payloadHash, rawS3Key, receivedAt
 
@@ -29,6 +29,8 @@ from datetime import datetime, timezone
 from typing import Optional
 
 import boto3
+import logging
+import uuid
 
 TABLE_NAME = os.environ["TABLE_NAME"]
 S3_BUCKET = os.environ["S3_BUCKET"]
@@ -36,6 +38,9 @@ S3_BUCKET = os.environ["S3_BUCKET"]
 dynamodb = boto3.resource("dynamodb")
 table = dynamodb.Table(TABLE_NAME)
 s3 = boto3.client("s3")
+
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
 
 
 def _now_iso() -> str:
@@ -51,21 +56,22 @@ def _hash_payload(payload) -> str:
         return ""
 
 
-def _store_event_payload(test_run_id: str, event_id: str, full_event: dict) -> str:
+def _store_event_payload(
+    test_instrument_run_id: str, event_id: str, full_event: dict
+) -> str:
     """
     Store the full EventBridge event in S3 and return the key.
 
     Path layout (time-based hierarchy):
 
-      events/testruns/{testRunId}/{YYYY}/{MM}/{DD}/{timestamp}-{eventId}.json
+      events/testruns/{testInstrumentRunId}/{YYYY}/{MM}/{DD}/{timestamp}-{eventId}.json
     """
     now = datetime.now(timezone.utc)
     yyyy = now.strftime("%Y")
     mm = now.strftime("%m")
     dd = now.strftime("%d")
-    ts = now.strftime("%Y-%m-%dT%H-%M-%SZ")
 
-    key = f"events/testruns/{test_run_id}/{yyyy}/{mm}/{dd}/{ts}-{event_id}.json"
+    key = f"events/testruns/{test_instrument_run_id}/{yyyy}/{mm}/{dd}/{event_id}.json"
 
     try:
         s3.put_object(
@@ -79,91 +85,51 @@ def _store_event_payload(test_run_id: str, event_id: str, full_event: dict) -> s
         return ""
 
 
-def _get_run_meta(test_run_id: str):
+def _get_run_meta(test_instrument_run_id: str):
     """
     Get run meta from DynamoDB.
 
     Returns the run meta item or None if not found.
     """
-    test_id = f"run#{test_run_id}"
+    test_id = f"run#{test_instrument_run_id}"
     key = {"testId": test_id, "sk": "run#meta"}
 
     try:
-        print(f"[Collector] Querying DynamoDB for testId={test_id}, sk=run#meta")
+        logger.info(f"[Collector] Querying DynamoDB for testId={test_id}, sk=run#meta")
         resp = table.get_item(Key=key)
         item = resp.get("Item")
 
         if item:
-            print(f"[Collector] Found run meta for testRunId={test_run_id}")
+            print(
+                f"[Collector] Found run meta for testInstrumentRunId={test_instrument_run_id}"
+            )
         else:
             print(
                 f"[Collector] No item found in DynamoDB response for testId={test_id}, sk=run#meta"
             )
             # Log the full response for debugging
-            print(f"[Collector] DynamoDB response: {json.dumps(resp)}")
+            logger.info(f"[Collector] DynamoDB response: {json.dumps(resp)}")
 
         return item
     except Exception as e:
-        print(f"[Collector] Error querying DynamoDB for testRunId={test_run_id}: {e}")
-        print(f"[Collector] Query key was: {json.dumps(key)}")
-        return None
-
-
-def _extract_test_run_id_from_id(detail: dict) -> Optional[str]:
-    """
-    Extract test_run_id from detail.ica-event.id field.
-
-    The id field has format "r.{uuid}" where uuid is the test_run_id without the "it-" prefix.
-    We reconstruct test_run_id by removing "r." prefix and adding "it-" prefix.
-
-    Returns the test_run_id (e.g., "it-{uuid}") or None if not found.
-    """
-    if not isinstance(detail, dict):
-        print("[Collector] Detail is not a dict")
-        return None
-
-    # Check for ica-event.id
-    ica_event = detail.get("ica-event")
-    if not isinstance(ica_event, dict):
-        print(
-            f"[Collector] ica-event not found or not a dict. Detail keys: {list(detail.keys())}"
+        logger.error(
+            f"[Collector] Error querying DynamoDB for testInstrumentRunId={test_instrument_run_id}: {e}"
         )
+        logger.error(f"[Collector] Query key was: {json.dumps(key)}")
         return None
-
-    id_value = ica_event.get("id")
-    if not isinstance(id_value, str):
-        print(
-            f"[Collector] ica-event.id not found or not a string. ica-event keys: {list(ica_event.keys())}"
-        )
-        return None
-
-    if not id_value.startswith("r."):
-        print(f"[Collector] ica-event.id does not start with 'r.': {id_value}")
-        return None
-
-    # Extract UUID by removing "r." prefix
-    uuid_str = id_value[2:]  # Remove "r." prefix
-    # Reconstruct test_run_id by adding "it-" prefix
-    test_run_id = f"it-{uuid_str}"
-    print(
-        f"[Collector] Extracted id={id_value}, uuid={uuid_str}, test_run_id={test_run_id}"
-    )
-    return test_run_id
 
 
 def handler(event, context):
     """
+    Collector  will consume all events from the EventBridge bus.
     EventBridge event shape (simplified):
-
       {
         "id": "...",
         "source": "...",
         "detail-type": "...",
         "detail": {
-          "ica-event": {
-            "id": "r.{uuid}",
-            ...
-          }
+          "instrumentRunId": "YYMMDD_A00001_XXXX_TESTXXXXXX",
+          ...
         },
         ...
     }
@@ -178,60 +144,55 @@ def handler(event, context):
     "region": "ap-southeast-2",
     "resources": [],
     "detail": {
-        "ica-event": {
-            "id": "r.56edb37d-5e24-4ed8-ace7-d2d24165531c",
-            "instrumentRunId": "260122_A0105_2253_IT874",
-            "name": "260122_A0105_2253_IT874",
-            ...
-        }
+        "instrumentRunId": "260122_A00001_1234_TEST123456",
+        ...
     }
-    }
-
-    The test_run_id is extracted from detail.ica-event.id by:
-    1. Removing "r." prefix to get UUID: "56edb37d-5e24-4ed8-ace7-d2d24165531c"
-    2. Adding "it-" prefix to reconstruct: "it-56edb37d-5e24-4ed8-ace7-d2d24165531c"
     """
-    print(f"[Collector] EventBridge event: {json.dumps(event)}")
+    logger.info(f"[Collector] EventBridge event: {json.dumps(event)}")
+    # Check if it is a event from details.detail-type: "Event from aws:sqs", if yes, ignore the event as it is seed events
+    # if no, continue with the event
 
-    detail = event.get("detail") or {}
+    if event.get("detail-type") == "Event from aws:sqs":
+        logger.info("[Collector] Event is a seed event, ignoring.")
+        return {"ignored": True, "reason": "seed_event"}
 
-    # Extract test_run_id from detail.ica-event.id
-    # The id field has format "r.{uuid}" where uuid is test_run_id without "it-" prefix
-    test_run_id = _extract_test_run_id_from_id(detail)
-    if not test_run_id:
-        print("[Collector] No ica-event.id found in event.detail, ignoring.")
-        return {"ignored": True, "reason": "no_ica_event_id"}
-
-    print(f"[Collector] Extracted testRunId={test_run_id} from ica-event.id")
-
-    run_meta = _get_run_meta(test_run_id)
+    test_instrument_run_id = event.get("detail").get("instrumentRunId")
+    run_meta = _get_run_meta(test_instrument_run_id)
     if not run_meta:
-        print(
-            f"[Collector] No run meta found for testRunId={test_run_id}, "
-            f"querying DynamoDB with testId=run#{test_run_id}, sk=run#meta. Ignoring event."
+        logger.info(
+            f"[Collector] No run meta found for testInstrumentRunId={test_instrument_run_id}, ignoring event."
         )
-        return {"ignored": True, "reason": "no_run_meta", "testRunId": test_run_id}
+        return {
+            "ignored": True,
+            "reason": "no_run_meta",
+            "testInstrumentRunId": test_instrument_run_id,
+        }
+    logger.info(
+        f"[Collector] Successfully found run meta for testInstrumentRunId={test_instrument_run_id}"
+    )
 
-    print(f"[Collector] Successfully found run meta for testRunId={test_run_id}")
-
-    event_id = event.get("id", "")
+    event_id = (
+        event.get("detail").get("id")
+        if event.get("detail").get("id")
+        else uuid.uuid4().replace("-", "")
+    )
     detail_type = event.get("detail-type", "")
     source = event.get("source", "")
 
     # Store full payload in S3 first (time-based path)
-    s3_key = _store_event_payload(test_run_id, event_id, event)
-    payload_hash = _hash_payload(detail)
+    s3_key = _store_event_payload(test_instrument_run_id, event_id, event)
+    payload_hash = _hash_payload(event.get("detail"))
     received_at = _now_iso()
 
     # Generate sort key: event#{timestamp}-{eventId}
     # Use microsecond precision for uniqueness
     now = datetime.now(timezone.utc)
     timestamp_str = now.strftime("%Y%m%dT%H%M%S.%f")[:-3]  # milliseconds
-    sk = f"event#{timestamp_str}-{event_id}"
+    sk = f"event#{timestamp_str}"
 
     # Write observed event record to DynamoDB
     event_item = {
-        "testId": f"run#{test_run_id}",
+        "testId": f"run#{test_instrument_run_id}",
         "sk": sk,
         "eventId": event_id,
         "detailType": detail_type,
@@ -244,15 +205,19 @@ def handler(event, context):
     try:
         table.put_item(Item=event_item)
         print(
-            f"[Collector] Stored event record for testRunId={test_run_id}, "
+            f"[Collector] Stored event record for testInstrumentRunId={test_instrument_run_id}, "
             f"detailType={detail_type}, source={source}"
         )
     except Exception as e:
         print(f"[Collector] Failed to store event record: {e}")
-        return {"testRunId": test_run_id, "stored": False, "error": str(e)}
+        return {
+            "testInstrumentRunId": test_instrument_run_id,
+            "stored": False,
+            "error": str(e),
+        }
 
     return {
-        "testRunId": test_run_id,
+        "testInstrumentRunId": test_instrument_run_id,
         "stored": True,
-        "eventKey": {"testId": f"run#{test_run_id}", "sk": sk},
+        "eventKey": {"testId": f"run#{test_instrument_run_id}", "sk": sk},
     }
