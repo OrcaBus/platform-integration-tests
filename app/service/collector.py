@@ -6,11 +6,11 @@ Triggered by EventBridge rule.
 
 EventBridge sends events that include:
 
-  detail.testMode   (bool, optional but recommended)
-  detail.testRunId  (string, required for test runs)
+  detail.ica-event.id  (string, format: "r.{uuid}" - required for test runs)
 
 Collector:
-  - Ignores events without detail.testRunId (not part of an integration test run).
+  - Extracts test_run_id from detail.ica-event.id by removing "r." prefix and adding "it-" prefix.
+  - Ignores events without detail.ica-event.id (not part of an integration test run).
   - Loads run meta (run#meta) to ensure the run exists.
   - Stores the full EventBridge event into S3 using a time-based path.
   - Writes observed event record to DynamoDB with:
@@ -84,30 +84,27 @@ def _get_run_meta(test_run_id: str):
     return resp.get("Item")
 
 
-def _extract_instrument_run_id(obj: dict) -> Optional[str]:
+def _extract_test_run_id_from_id(detail: dict) -> Optional[str]:
     """
-    Recursively search for instrumentRunId in nested dictionaries.
-    Returns the first instrumentRunId found, or None if not found.
+    Extract test_run_id from detail.ica-event.id field.
+
+    The id field has format "r.{uuid}" where uuid is the test_run_id without the "it-" prefix.
+    We reconstruct test_run_id by removing "r." prefix and adding "it-" prefix.
+
+    Returns the test_run_id (e.g., "it-{uuid}") or None if not found.
     """
-    if not isinstance(obj, dict):
+    if not isinstance(detail, dict):
         return None
 
-    # Check if instrumentRunId exists at this level
-    if "instrumentRunId" in obj:
-        return obj["instrumentRunId"]
-
-    # Recursively search nested dictionaries
-    for value in obj.values():
-        if isinstance(value, dict):
-            result = _extract_instrument_run_id(value)
-            if result is not None:
-                return result
-        elif isinstance(value, list):
-            for item in value:
-                if isinstance(item, dict):
-                    result = _extract_instrument_run_id(item)
-                    if result is not None:
-                        return result
+    # Check for ica-event.id
+    ica_event = detail.get("ica-event")
+    if isinstance(ica_event, dict):
+        id_value = ica_event.get("id")
+        if isinstance(id_value, str) and id_value.startswith("r."):
+            # Extract UUID by removing "r." prefix
+            uuid_str = id_value[2:]  # Remove "r." prefix
+            # Reconstruct test_run_id by adding "it-" prefix
+            return f"it-{uuid_str}"
 
     return None
 
@@ -121,61 +118,47 @@ def handler(event, context):
         "source": "...",
         "detail-type": "...",
         "detail": {
-          "testMode": true,
-          "testRunId": "<runId>",
-          ...
+          "ica-event": {
+            "id": "r.{uuid}",
+            ...
+          }
         },
         ...
     }
     Example EventBridge event:
     {
     "version": "0",
-    "id": "437de356-417b-82d6-3dec-15c85699c743",
-    "detail-type": "SequenceRunStateChange",
-    "source": "orcabus.sequencerunmanager",
+    "id": "7fff8d7d-fed8-b38f-2c0b-c843b0e194e2",
+    "detail-type": "Event from aws:sqs",
+    "source": "Pipe IcaEventPipeConstru-IntegrationTest",
     "account": "455634345446",
-    "time": "2025-12-04T23:19:23Z",
+    "time": "2026-01-22T02:11:48Z",
     "region": "ap-southeast-2",
     "resources": [],
     "detail": {
-        "id": "seq.01KBNTKGADBP60RAXD241TATDT",
-        "instrumentRunId": "251125_A01052_0001_IT001",
-        "runVolumeName": "bssh.testvolume.it001",
-        "runFolderPath": "",
-        "runDataUri": "gds://bssh.testvolume.it001",
-        "sampleSheetName": "sampleSheet_it_test.csv",
-        "startTime": "2025-11-25T01:59:30Z",
-        "endTime": null,
-        "status": "STARTED"
-        ......
+        "ica-event": {
+            "id": "r.56edb37d-5e24-4ed8-ace7-d2d24165531c",
+            "instrumentRunId": "260122_A0105_2253_IT874",
+            "name": "260122_A0105_2253_IT874",
+            ...
         }
     }
+    }
+
+    The test_run_id is extracted from detail.ica-event.id by:
+    1. Removing "r." prefix to get UUID: "56edb37d-5e24-4ed8-ace7-d2d24165531c"
+    2. Adding "it-" prefix to reconstruct: "it-56edb37d-5e24-4ed8-ace7-d2d24165531c"
     """
     print(f"[Collector] EventBridge event: {json.dumps(event)}")
 
     detail = event.get("detail") or {}
 
-    # Only handle events that belong to a test run
-    test_run_id = detail.get("testRunId")
+    # Extract test_run_id from detail.ica-event.id
+    # The id field has format "r.{uuid}" where uuid is test_run_id without "it-" prefix
+    test_run_id = _extract_test_run_id_from_id(detail)
     if not test_run_id:
-        print("[Collector] No testRunId in event.detail, ignoring.")
-        return {"ignored": True, "reason": "no_testRunId"}
-
-    # Extract instrumentRunId from event detail (may be nested)
-    instrument_run_id = _extract_instrument_run_id(detail)
-
-    # Validate that instrumentRunId matches testRunId
-    if instrument_run_id and instrument_run_id != test_run_id:
-        print(
-            f"[Collector] instrumentRunId mismatch: instrumentRunId={instrument_run_id}, "
-            f"testRunId={test_run_id}, ignoring."
-        )
-        return {
-            "ignored": True,
-            "reason": "instrumentRunId_mismatch",
-            "testRunId": test_run_id,
-            "instrumentRunId": instrument_run_id,
-        }
+        print("[Collector] No ica-event.id found in event.detail, ignoring.")
+        return {"ignored": True, "reason": "no_ica_event_id"}
 
     run_meta = _get_run_meta(test_run_id)
     if not run_meta:
