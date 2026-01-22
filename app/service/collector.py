@@ -96,7 +96,9 @@ def _get_run_meta(test_run_id: str):
         if item:
             print(f"[Collector] Found run meta for testRunId={test_run_id}")
         else:
-            print(f"[Collector] No item found in DynamoDB response for testId={test_id}, sk=run#meta")
+            print(
+                f"[Collector] No item found in DynamoDB response for testId={test_id}, sk=run#meta"
+            )
             # Log the full response for debugging
             print(f"[Collector] DynamoDB response: {json.dumps(resp)}")
 
@@ -123,12 +125,16 @@ def _extract_test_run_id_from_id(detail: dict) -> Optional[str]:
     # Check for ica-event.id
     ica_event = detail.get("ica-event")
     if not isinstance(ica_event, dict):
-        print(f"[Collector] ica-event not found or not a dict. Detail keys: {list(detail.keys())}")
+        print(
+            f"[Collector] ica-event not found or not a dict. Detail keys: {list(detail.keys())}"
+        )
         return None
 
     id_value = ica_event.get("id")
     if not isinstance(id_value, str):
-        print(f"[Collector] ica-event.id not found or not a string. ica-event keys: {list(ica_event.keys())}")
+        print(
+            f"[Collector] ica-event.id not found or not a string. ica-event keys: {list(ica_event.keys())}"
+        )
         return None
 
     if not id_value.startswith("r."):
@@ -139,7 +145,9 @@ def _extract_test_run_id_from_id(detail: dict) -> Optional[str]:
     uuid_str = id_value[2:]  # Remove "r." prefix
     # Reconstruct test_run_id by adding "it-" prefix
     test_run_id = f"it-{uuid_str}"
-    print(f"[Collector] Extracted id={id_value}, uuid={uuid_str}, test_run_id={test_run_id}")
+    print(
+        f"[Collector] Extracted id={id_value}, uuid={uuid_str}, test_run_id={test_run_id}"
+    )
     return test_run_id
 
 
