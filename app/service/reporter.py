@@ -198,9 +198,9 @@ def _format_events_table(events: List[Dict[str, Any]], event_type: str) -> str:
 
     html = "<table><tr>"
     if event_type == "matched":
-        html += "<th>Order</th><th>Detail Type</th><th>Source</th><th>Event ID</th><th>Received At</th><th>Verifier At</th>"
+        html += "<th>Order</th><th>Detail Type</th><th>Source</th><th>Event ID</th><th>Received At</th><th>Verified At</th>"
     elif event_type == "missing":
-        html += "<th>Order</th><th>Detail Type</th><th>Source</th><th>Expected Event</th><th>Verifier At</th>"
+        html += "<th>Order</th><th>Detail Type</th><th>Source</th><th>Expected Event</th><th>Verified At</th>"
     else:  # unexpected
         html += (
             "<th>Detail Type</th><th>Source</th><th>Event ID</th><th>Received At</th>"
@@ -215,14 +215,14 @@ def _format_events_table(events: List[Dict[str, Any]], event_type: str) -> str:
             html += f"<td>{event.get('source', 'N/A')}</td>"
             html += f"<td>{event.get('eventId', 'N/A')}</td>"
             html += f"<td>{event.get('receivedAt', 'N/A')}</td>"
-            html += f"<td>{event.get('verifierAt', 'N/A')}</td>"
+            html += f"<td>{event.get('verifiedAt', 'N/A')}</td>"
         elif event_type == "missing":
             html += f"<td>{event.get('expectedOrder', 'N/A')}</td>"
             html += f"<td>{event.get('detailType', 'N/A')}</td>"
             html += f"<td>{event.get('source', 'N/A')}</td>"
             expected = event.get("expectedEvent", {})
             html += f"<td><pre>{json.dumps(expected, indent=2)}</pre></td>"
-            html += f"<td>{event.get('verifierAt', 'N/A')}</td>"
+            html += f"<td>{event.get('verifiedAt', 'N/A')}</td>"
         else:  # unexpected
             html += f"<td>{event.get('detailType', 'N/A')}</td>"
             html += f"<td>{event.get('source', 'N/A')}</td>"

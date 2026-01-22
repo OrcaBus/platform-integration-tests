@@ -394,7 +394,6 @@ def handler(event, context):
     meta_item = {
         "testId": f"run#{test_run_id}",
         "sk": "run#meta",
-        "runId": test_run_id,
         "serviceName": effective_service_name,
         "observedCount": 0,
         "status": "running",

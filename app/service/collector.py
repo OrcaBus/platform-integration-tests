@@ -201,7 +201,6 @@ def handler(event, context):
     event_item = {
         "testId": f"run#{test_run_id}",
         "sk": sk,
-        "testRunId": test_run_id,
         "eventId": event_id,
         "detailType": detail_type,
         "source": source,
