@@ -160,7 +160,7 @@ def _publish_test_events(
         return 0
 
     # Generate dynamic IDs for this test run
-    run_id = f"r.{uuid.uuid4().replace('-', '')}"
+    run_id = f"r.{uuid.uuid4().hex}"
     logger.info(
         "Generated dynamic IDs for instrumentRunId=%s, id=%s",
         instrument_run_id,
