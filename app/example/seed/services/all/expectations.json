@@ -13,6 +13,9 @@
       "endTime": null,
       "status": "STARTED"
     },
+    "__replace": {
+      "testInstrumentRunIdField": ["detail.instrumentRunId"]
+    },
     "__match": {
       "fields": [
         "detail-type",
@@ -36,6 +39,9 @@
       "runDataUri": "gds://bssh.testvolume.it001",
       "sampleSheetName": "sampleSheet_it_test.csv",
       "status": "SUCCEEDED"
+    },
+    "__replace": {
+      "testInstrumentRunIdField": ["detail.instrumentRunId"]
     },
     "__match": {
       "fields": [

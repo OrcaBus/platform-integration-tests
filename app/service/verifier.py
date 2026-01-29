@@ -158,6 +158,89 @@ def _get_nested_value(obj: Dict[str, Any], path: str) -> Any:
     return value
 
 
+def _set_nested_field(obj: Dict[str, Any], path: str, value: Any) -> None:
+    """
+    Set a nested field value using dot-notation path (e.g., "detail.instrumentRunId").
+    Creates intermediate dictionaries if they don't exist.
+    """
+    parts = path.split(".")
+    current = obj
+    for part in parts[:-1]:
+        if part not in current:
+            current[part] = {}
+        elif not isinstance(current[part], dict):
+            current[part] = {}
+        current = current[part]
+    current[parts[-1]] = value
+
+
+def _apply_format(value: str, format_config: Optional[Dict[str, str]]) -> str:
+    """
+    Apply prefix and/or suffix formatting to a value based on format configuration.
+    format_config can have "prefix" and/or "suffix" keys.
+    """
+    if not format_config:
+        return value
+
+    prefix = format_config.get("prefix", "")
+    suffix = format_config.get("suffix", "")
+    return f"{prefix}{value}{suffix}"
+
+
+def _process_replace_fields(
+    expectation: Dict[str, Any], test_instrument_run_id: str
+) -> Dict[str, Any]:
+    """
+    Process __replace fields in expectation and replace them with actual values.
+    Similar to seeder.py logic but for expectations.
+
+    Supported replace fields:
+    - testInstrumentRunIdField: Replace with test_instrument_run_id
+    - timeStampField: Replace with current timestamp (ISO format)
+    """
+    # Deep copy to avoid modifying original
+    processed = json.loads(json.dumps(expectation))
+
+    replace_config = processed.get("__replace", {})
+    if not replace_config:
+        return processed
+
+    # Process testInstrumentRunIdField
+    if "testInstrumentRunIdField" in replace_config:
+        test_run_fields = replace_config["testInstrumentRunIdField"]
+        if isinstance(test_run_fields, list):
+            for field_config in test_run_fields:
+                if isinstance(field_config, dict):
+                    # Object with name and optional format
+                    field_path = field_config.get("name")
+                    format_config = field_config.get("format")
+                    if field_path:
+                        value = _apply_format(test_instrument_run_id, format_config)
+                        _set_nested_field(processed, field_path, value)
+                elif isinstance(field_config, str):
+                    # Simple string path
+                    value = test_instrument_run_id
+                    _set_nested_field(processed, field_config, value)
+
+    # Process timeStampField (if needed in future)
+    if "timeStampField" in replace_config:
+        from datetime import datetime, timezone
+
+        current_timestamp = (
+            datetime.now(timezone.utc).isoformat(timespec="seconds") + "Z"
+        )
+        timestamp_fields = replace_config["timeStampField"]
+        if isinstance(timestamp_fields, list):
+            for field_path in timestamp_fields:
+                if isinstance(field_path, str):
+                    _set_nested_field(processed, field_path, current_timestamp)
+
+    # Remove __replace field after processing
+    processed.pop("__replace", None)
+
+    return processed
+
+
 def _match_event(
     expected: Dict[str, Any],
     observed_event_body: Dict[str, Any],
@@ -398,8 +481,13 @@ def _verify_mode(test_instrument_run_id: str) -> dict:
 
     # Process each expected event in order
     for idx, expected in enumerate(expectations):
-        detail_type = expected.get("detail-type")
-        source = expected.get("source")
+        # Process __replace fields first to get the processed expectation
+        processed_expected = _process_replace_fields(expected, test_instrument_run_id)
+
+        detail_type = processed_expected.get("detail-type") or expected.get(
+            "detail-type"
+        )
+        source = processed_expected.get("source") or expected.get("source")
         match_fields = expected.get("__match", {}).get("fields", [])
 
         if not detail_type or not source:
@@ -413,8 +501,10 @@ def _verify_mode(test_instrument_run_id: str) -> dict:
             test_instrument_run_id, detail_type, source
         )
 
-        # Find matching event
-        matched_event = _find_matching_event(expected, observed_events, match_fields)
+        # Find matching event using processed expectation
+        matched_event = _find_matching_event(
+            processed_expected, observed_events, match_fields
+        )
 
         if matched_event:
             # Write match info to DynamoDB
@@ -431,7 +521,7 @@ def _verify_mode(test_instrument_run_id: str) -> dict:
                         ":status": "matched",
                         ":verifiedAt": verifier_at,
                         ":order": idx,
-                        ":expected": expected,
+                        ":expected": processed_expected,
                     },
                 )
                 print(
@@ -452,7 +542,7 @@ def _verify_mode(test_instrument_run_id: str) -> dict:
                     "sk": missing_sk,
                     "detailType": detail_type,
                     "source": source,
-                    "expectedEvent": expected,
+                    "expectedEvent": processed_expected,
                     "status": "missed",
                     "verifiedAt": verifier_at,
                     "expectedOrder": idx,
@@ -537,22 +627,23 @@ def _verify_mode(test_instrument_run_id: str) -> dict:
 def handler(event, context):
     """
     Mode selection:
+    Verifier will use the testInstrumentRunId from seedResult if it is available.
 
-    - Status mode (called by SFN loop):
+    - Status mode (called by SFN loop when status is running):
       { "testInstrumentRunId": "...", "mode": "status" }
       or
       { "testRunId": "...", "mode": "status" }
       or
       { "runId": "...", "mode": "status" }
 
-    - Verify mode (called by SFN after ready/timeout):
+    - Verify mode (called by SFN after status is ready or timeout):
       { "testInstrumentRunId": "...", "mode": "verify" }
       or
       { "testRunId": "...", "mode": "verify" }
       or
       { "runId": "...", "mode": "verify" }
 
-    Note: The seeder now returns testInstrumentRunId in seedResult.
+
     """
     print(f"[Verifier] Event: {json.dumps(event)}")
 

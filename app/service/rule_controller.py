@@ -40,10 +40,14 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         EVENT_BUS_NAME,
     )
 
-    if action == "enable":
-        events_client.enable_rule(Name=RULE_NAME, EventBusName=EVENT_BUS_NAME)
-    else:
-        events_client.disable_rule(Name=RULE_NAME, EventBusName=EVENT_BUS_NAME)
+    try:
+        if action == "enable":
+            events_client.enable_rule(Name=RULE_NAME, EventBusName=EVENT_BUS_NAME)
+        else:
+            events_client.disable_rule(Name=RULE_NAME, EventBusName=EVENT_BUS_NAME)
+    except Exception as e:
+        logger.error(f"RuleController: error={e}")
+        raise e
 
     return {
         "ruleName": RULE_NAME,

@@ -323,7 +323,7 @@ export class IntegrationTestsHarnessStack extends Stack {
       .next(finalState);
 
     // Choice based on status.status
-    const statusChoice = new Choice(this, 'RunReadyOrTimeout?')
+    const statusChoice = new Choice(this, 'EventsReadyOrTimeout?')
       .when(Condition.stringEquals('$.status.status', 'ready'), verifyAndReportChain)
       .when(Condition.stringEquals('$.status.status', 'timeout'), verifyAndReportChain);
 
