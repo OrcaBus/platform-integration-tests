@@ -3,7 +3,7 @@
     "version": "0",
     "id": "r.it001",
     "detail-type": "Event from aws:sqs",
-    "source": "Pipe IcaEventPipeConstru-IntegrationTest",
+    "source": "orcabus.integrationtests",
     "account": "000000000000",
     "time": "2025-11-25T02:00:00Z",
     "region": "ap-southeast-2",
@@ -25,13 +25,31 @@
         "instrumentRunId": "251125_A01052_0001_IT001",
         "status": "New"
       }
+    },
+    "__replace": {
+      "randomUniqueIdField": [
+        {
+          "name": "detail.icaEvent.id",
+          "format": {
+            "prefix": "r."
+          }
+        },
+        {
+          "name": "detail.icaEvent.apiUrl",
+          "format": {
+            "prefix": "https://api.fake.test/v2/runs/"
+          }
+        }
+      ],
+      "testInstrumentRunIdField": ["detail.icaEvent.instrumentRunId", "detail.icaEvent.name"],
+      "timeStampField": ["time", "detail.icaEvent.dateModified"]
     }
   },
   {
     "version": "0",
     "id": "r.it001-uploading",
     "detail-type": "Event from aws:sqs",
-    "source": "Pipe IcaEventPipeConstru-IntegrationTest",
+    "source": "orcabus.integrationtests",
     "account": "000000000000",
     "time": "2025-11-25T02:00:00Z",
     "region": "ap-southeast-2",
@@ -53,13 +71,31 @@
         "instrumentRunId": "251125_A01052_0001_IT001",
         "status": "uploading"
       }
+    },
+    "__replace": {
+      "randomUniqueIdField": [
+        {
+          "name": "detail.icaEvent.id",
+          "format": {
+            "prefix": "r."
+          }
+        },
+        {
+          "name": "detail.icaEvent.apiUrl",
+          "format": {
+            "prefix": "https://api.fake.test/v2/runs/"
+          }
+        }
+      ],
+      "testInstrumentRunIdField": ["detail.icaEvent.instrumentRunId", "detail.icaEvent.name"],
+      "timeStampField": ["time", "detail.icaEvent.dateModified"]
     }
   },
   {
     "version": "0",
     "id": "r.it001-pendinganalysis",
     "detail-type": "Event from aws:sqs",
-    "source": "Pipe IcaEventPipeConstru-IntegrationTest",
+    "source": "orcabus.integrationtests",
     "account": "000000000000",
     "time": "2025-11-25T02:05:00Z",
     "region": "ap-southeast-2",
@@ -81,13 +117,31 @@
         "instrumentRunId": "251125_A01052_0001_IT001",
         "status": "pendinganalysis"
       }
+    },
+    "__replace": {
+      "randomUniqueIdField": [
+        {
+          "name": "detail.icaEvent.id",
+          "format": {
+            "prefix": "r."
+          }
+        },
+        {
+          "name": "detail.icaEvent.apiUrl",
+          "format": {
+            "prefix": "https://api.fake.test/v2/runs/"
+          }
+        }
+      ],
+      "testInstrumentRunIdField": ["detail.icaEvent.instrumentRunId", "detail.icaEvent.name"],
+      "timeStampField": ["time", "detail.icaEvent.dateModified"]
     }
   },
   {
     "version": "0",
     "id": "r.it001-complete",
     "detail-type": "Event from aws:sqs",
-    "source": "Pipe IcaEventPipeConstru-IntegrationTest",
+    "source": "orcabus.integrationtests",
     "account": "000000000000",
     "time": "2025-11-25T02:10:00Z",
     "region": "ap-southeast-2",
@@ -109,6 +163,24 @@
         "instrumentRunId": "251125_A01052_0001_IT001",
         "status": "complete"
       }
+    },
+    "__replace": {
+      "randomUniqueIdField": [
+        {
+          "name": "detail.icaEvent.id",
+          "format": {
+            "prefix": "r."
+          }
+        },
+        {
+          "name": "detail.icaEvent.apiUrl",
+          "format": {
+            "prefix": "https://api.fake.test/v2/runs/"
+          }
+        }
+      ],
+      "testInstrumentRunIdField": ["detail.icaEvent.instrumentRunId", "detail.icaEvent.name"],
+      "timeStampField": ["time", "detail.icaEvent.dateModified"]
     }
   }
 ]

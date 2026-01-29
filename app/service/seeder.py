@@ -40,27 +40,16 @@ def _now_iso() -> str:
     )
 
 
-def _resolve_service_name(raw_service_name: Optional[str]) -> str:
-    """
-    Normalise the serviceName:
-    - None or "all" -> "all"
-    - otherwise: lowercased string, used as folder name.
-    """
-    if raw_service_name is None or str(raw_service_name).lower() == "all":
-        return "all"
-    return str(raw_service_name).lower()
-
-
 def _s3_keys_for_service(service_name: str) -> Tuple[str, str]:
     """
-    Return (events_key, expectations_key) for a given serviceName.
+    Return (seeds_key, expectations_key) for a given serviceName.
     Layout:
-      seed/services/{serviceName}/events.json
+      seed/services/{serviceName}/seeds.json
       seed/services/{serviceName}/expectations.json
     """
     base_prefix = f"seed/services/{service_name}/"
     return (
-        base_prefix + "events.json",
+        base_prefix + "seeds.json",
         base_prefix + "expectations.json",
     )
 
@@ -91,12 +80,14 @@ def _load_service_seed_definitions(
     Returns (events, effective_service_name).
     """
     requested_service_name = service_name
-    events_key, _ = _s3_keys_for_service(requested_service_name)
+    seeds_key, _ = _s3_keys_for_service(requested_service_name)
 
     try:
-        events = _load_s3_json_list(S3_BUCKET, events_key)
-        logger.info("Loaded seeds for serviceName=%s", requested_service_name)
-        return events, requested_service_name
+        seeds = _load_s3_json_list(S3_BUCKET, seeds_key)
+        logger.info(
+            "Loaded %d seeds for serviceName=%s", len(seeds), requested_service_name
+        )
+        return seeds, requested_service_name
     except ClientError as e:
         code = e.response.get("Error", {}).get("Code")
         if code not in ("NoSuchKey", "NoSuchBucket"):
@@ -110,9 +101,9 @@ def _load_service_seed_definitions(
             "Seed definitions for serviceName=%s not found, falling back to 'all'",
             requested_service_name,
         )
-        events_key, _ = _s3_keys_for_service("all")
-        events = _load_s3_json_list(S3_BUCKET, events_key)
-        return events, "all"
+        seeds_key, _ = _s3_keys_for_service("all")
+        seeds = _load_s3_json_list(S3_BUCKET, seeds_key)
+        return seeds, "all"
 
 
 def _deep_replace_in_dict(obj: Any, old_value: str, new_value: str) -> Any:
@@ -131,6 +122,35 @@ def _deep_replace_in_dict(obj: Any, old_value: str, new_value: str) -> Any:
         return obj
 
 
+def _set_nested_field(obj: Dict[str, Any], path: str, value: Any) -> None:
+    """
+    Set a nested field value using dot-notation path (e.g., "detail.icaEvent.id").
+    Creates intermediate dictionaries if they don't exist.
+    """
+    parts = path.split(".")
+    current = obj
+    for part in parts[:-1]:
+        if part not in current:
+            current[part] = {}
+        elif not isinstance(current[part], dict):
+            current[part] = {}
+        current = current[part]
+    current[parts[-1]] = value
+
+
+def _apply_format(value: str, format_config: Optional[Dict[str, str]]) -> str:
+    """
+    Apply prefix and/or suffix formatting to a value based on format configuration.
+    format_config can have "prefix" and/or "suffix" keys.
+    """
+    if not format_config:
+        return value
+
+    prefix = format_config.get("prefix", "")
+    suffix = format_config.get("suffix", "")
+    return f"{prefix}{value}{suffix}"
+
+
 def _publish_test_events(
     instrument_run_id: str,
     service_name: str,
@@ -141,39 +161,66 @@ def _publish_test_events(
     to simulate a real service emitting a sequence of status updates over time.
 
     events_definitions is expected to be an array of EventBridge event objects like:
-
     {
       "source": "Pipe IcaEventPipeConstru-IntegrationTest",
       "detail-type": "Event from aws:sqs",
+      "time": "2025-01-01T00:00:00Z",
       "detail": { ... arbitrary payload ... }
+      "__replace": {
+        "randomUniqueIdField": [
+          {
+            "name": "detail.icaEvent.id",
+            "format": {
+              "prefix": "r." # prefix, suffix, or both
+            }
+          },
+        ],
+        "testRunIdField": [
+          "detail.icaEvent.instrumentRunId",
+          "detail.icaEvent.name"
+        ],
+        "timeStampField": [
+          "time",
+          "detail.icaEvent.dateModified"
+        ]
+      }
     }
 
     Supports both lowercase (new format) and capitalized (legacy) field names.
 
     Dynamically replaces:
-    - instrumentRunId and name with test_instrument_run_id format
-    - id with r.{uuid} format (uuid without "-")
-    - apiUrl to use the new id, but fake url
+    - randomUniqueIdField with random unique id format
+    - testRunIdField with test_instrument_run_id format
+    - timeStampField with time and dateModified format
     """
     if not events_definitions:
         logger.info("No events to publish for serviceName=%s", service_name)
         return 0
 
-    # Generate dynamic IDs for this test run
-    run_id = f"r.{uuid.uuid4().hex}"
+    # Generate current timestamp (used for timeStampField)
+    current_timestamp = _now_iso()
+
     logger.info(
-        "Generated dynamic IDs for instrumentRunId=%s, id=%s",
+        "Starting event publishing for instrumentRunId=%s, timestamp=%s",
         instrument_run_id,
-        run_id,
+        current_timestamp,
     )
 
     published_count = 0
 
     for idx, ev in enumerate(events_definitions):
+        # Generate a new random unique ID for each event (used for randomUniqueIdField)
+        random_unique_id = uuid.uuid4().hex
+
+        # Deep copy the event to avoid modifying the original
+        event_copy = json.loads(json.dumps(ev))
+
         # Extract source and detail-type (handle both lowercase and capitalized)
-        source = ev.get("source") or ev.get("Source")
+        source = event_copy.get("source") or event_copy.get("Source")
         detail_type = (
-            ev.get("detail-type") or ev.get("DetailType") or ev.get("detailType")
+            event_copy.get("detail-type")
+            or event_copy.get("DetailType")
+            or event_copy.get("detailType")
         )
 
         if not source:
@@ -186,68 +233,63 @@ def _publish_test_events(
             raise ValueError(f"Event {idx + 1} must have a 'detail-type' field")
 
         # Extract detail (handle both lowercase and capitalized)
-        detail = ev.get("detail") or ev.get("Detail", {})
+        detail = event_copy.get("detail") or event_copy.get("Detail", {})
 
         # If detail is not a dict, wrap it or use as-is
         if not isinstance(detail, dict):
             detail = {"data": detail}
+            event_copy["detail"] = detail
 
-        # Deep copy detail to avoid modifying the original
-        detail = json.loads(json.dumps(detail))
+        # Process __replace field if it exists
+        replace_config = event_copy.get("__replace", {})
+        if replace_config:
+            # Process randomUniqueIdField
+            if "randomUniqueIdField" in replace_config:
+                random_fields = replace_config["randomUniqueIdField"]
+                if isinstance(random_fields, list):
+                    for field_config in random_fields:
+                        if isinstance(field_config, dict):
+                            # Object with name and optional format
+                            field_path = field_config.get("name")
+                            format_config = field_config.get("format")
+                            if field_path:
+                                value = _apply_format(random_unique_id, format_config)
+                                _set_nested_field(event_copy, field_path, value)
+                        elif isinstance(field_config, str):
+                            # Simple string path
+                            value = random_unique_id
+                            _set_nested_field(event_copy, field_config, value)
 
-        # Helper function to replace patterns in strings recursively
-        def _replace_patterns_in_dict(obj: Any) -> Any:
-            """Recursively replace r.itXXX patterns and instrumentRunId/name patterns."""
-            if isinstance(obj, dict):
-                result = {}
-                for k, v in obj.items():
-                    if k in ("id", "instrumentRunId", "name") and isinstance(v, str):
-                        # Replace r.itXXX patterns in id fields
-                        if k == "id" and re.match(r"r\.it\d+", v):
-                            result[k] = run_id
-                        # Replace instrumentRunId/name patterns (date-based format)
-                        elif k in ("instrumentRunId", "name") and re.match(
-                            r"\d{6}_A\d+_\d{4}_TEST\d+", v
-                        ):
-                            result[k] = instrument_run_id
-                        else:
-                            result[k] = _replace_patterns_in_dict(v)
-                    elif k == "apiUrl" and isinstance(v, str):
-                        # Replace /runs/r.itXXX patterns in URLs
-                        result[k] = re.sub(r"/runs/r\.it\d+", f"/runs/{run_id}", v)
-                    else:
-                        result[k] = _replace_patterns_in_dict(v)
-                return result
-            elif isinstance(obj, list):
-                return [_replace_patterns_in_dict(item) for item in obj]
-            elif isinstance(obj, str):
-                if re.match(r"r\.it\d+", obj):
-                    return obj.replace(r"r\.it\d+", run_id)
-                if re.match(r"\d{6}_A\d+_\d{4}_TEST\d+", obj):
-                    return obj.replace(r"\d{6}_A\d+_\d{4}_TEST\d+", instrument_run_id)
-                else:
-                    return obj
-            else:
-                return obj
+            # Process testInstrumentRunIdField
+            if "testInstrumentRunIdField" in replace_config:
+                test_run_fields = replace_config["testInstrumentRunIdField"]
+                if isinstance(test_run_fields, list):
+                    for field_config in test_run_fields:
+                        if isinstance(field_config, dict):
+                            # Object with name and optional format
+                            field_path = field_config.get("name")
+                            format_config = field_config.get("format")
+                            if field_path:
+                                value = _apply_format(instrument_run_id, format_config)
+                                _set_nested_field(event_copy, field_path, value)
+                        elif isinstance(field_config, str):
+                            # Simple string path
+                            value = instrument_run_id
+                            _set_nested_field(event_copy, field_config, value)
 
-        # Apply pattern replacements
-        detail = _replace_patterns_in_dict(detail)
+            # Process timeStampField
+            if "timeStampField" in replace_config:
+                timestamp_fields = replace_config["timeStampField"]
+                if isinstance(timestamp_fields, list):
+                    for field_path in timestamp_fields:
+                        if isinstance(field_path, str):
+                            _set_nested_field(event_copy, field_path, current_timestamp)
 
-        # Explicitly update nested structures like detail["ica-event"] if they exist
-        # This ensures the fields are set even if they didn't exist before
-        if "ica-event" in detail:
-            ica_event = detail["ica-event"]
-            if isinstance(ica_event, dict):
-                ica_event["id"] = run_id
-                ica_event["instrumentRunId"] = instrument_run_id
-                ica_event["name"] = instrument_run_id
-                # Update apiUrl if it exists
-                if "apiUrl" in ica_event and isinstance(ica_event["apiUrl"], str):
-                    ica_event["apiUrl"] = re.sub(
-                        r"/runs/r\.it\d+", f"/runs/{run_id}", ica_event["apiUrl"]
-                    )
+        # Remove __replace field from the event before publishing
+        event_copy.pop("__replace", None)
 
-            detail.setdefault("instrumentRunId", instrument_run_id)
+        # Extract detail again after replacements (in case it was modified)
+        detail = event_copy.get("detail") or event_copy.get("Detail", {})
 
         entry = {
             "EventBusName": EVENT_BUS_NAME,
@@ -255,6 +297,10 @@ def _publish_test_events(
             "DetailType": detail_type,
             "Detail": json.dumps(detail),
         }
+
+        # Include time field if it exists in the event
+        if "time" in event_copy:
+            entry["Time"] = event_copy["time"]
 
         logger.info(
             "Publishing test event %d/%d for instrumentRunId=%s, serviceName=%s (source=%s, detailType=%s)",
@@ -289,16 +335,47 @@ def _publish_test_events(
     return published_count
 
 
-def _generate_test_instrument_run_id() -> str:
+def _resolve_service_name(raw_service_name: Optional[str]) -> Tuple[str, str]:
+    """
+    Normalise the serviceName:
+    - None or "all" -> "all"
+    - otherwise: lowercased string, used as folder name.
+    """
+    if raw_service_name is None or str(raw_service_name).lower() == "all":
+        return "all", "ALL"
+
+    try:
+        # get service name abbreviation from local events-map.json
+        config_dir = os.path.join(os.path.dirname(__file__), "..", "config")
+        events_map_path = os.path.join(config_dir, "events-map.json")
+        with open(events_map_path, "r", encoding="utf-8") as f:
+            events_map = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError) as e:
+        logger.error(f"Error loading events-map.json: {e}")
+        raise
+
+    if raw_service_name not in events_map["abbreviations"]:
+        logger.error(
+            f"Service name {raw_service_name} not supported for current integration test."
+        )
+        raise ValueError(
+            f"Service name {raw_service_name} not supported for current integration test."
+        )
+
+    return str(raw_service_name).lower(), events_map["abbreviations"][raw_service_name]
+
+
+def _generate_test_instrument_run_id(service_name_abbreviation: str) -> str:
     """
     Generate a test run id (instrumentRunId) in the format
-    date in format YYMMDD_A00001_XXXX_TESTXXXXXX
-    X will be randomly generated from 0001 to 9999 in string format
+    date in format YYMMDD_A00001_XXXX_TESTSRMXXX
+    X will be randomly generated from 0 to 9 in string format
     """
     # Generate random number from 0001 to 9999
     random_number_str_4digits = random.randint(1, 9999)
-    random_number_str_6digits = random.randint(1, 999999)
-    return f"{datetime.now(tz=timezone.utc).strftime('%y%m%d')}_A00001_{random_number_str_4digits:04d}_TEST{random_number_str_6digits:06d}"
+    random_number_str_3digits = random.randint(1, 999)
+
+    return f"{datetime.now(tz=timezone.utc).strftime('%y%m%d')}_A00001_{random_number_str_4digits:04d}_TEST{service_name_abbreviation}{random_number_str_3digits:03d}"
 
 
 def handler(event, context):
@@ -316,16 +393,22 @@ def handler(event, context):
     """
     print(f"[Seeder] Event: {json.dumps(event)}")
 
-    # we
-    test_instrument_run_id = _generate_test_instrument_run_id()
-    raw_service_name = event.get("serviceName")
-    requested_service_name = _resolve_service_name(raw_service_name)
+    # retrieve payload from event
+    payload = event.get("payload")
+    if not payload:
+        raise ValueError("payload is required")
+    raw_service_name = payload.get("serviceName", "all")
+    requested_service_name, service_name_abbreviation = _resolve_service_name(
+        raw_service_name
+    )
+
+    # random generate test instrument run id for the test run
+    test_instrument_run_id = _generate_test_instrument_run_id(service_name_abbreviation)
 
     logger.info(
-        "Starting seeding for testInstrumentRunId=%s, requestedServiceName=%s (raw=%r)",
+        "Starting seeding for testInstrumentRunId=%s, requestedServiceName=%s",
         test_instrument_run_id,
         requested_service_name,
-        raw_service_name,
     )
 
     try:
@@ -342,7 +425,7 @@ def handler(event, context):
 
     now = datetime.now(tz=timezone.utc)
     started_at = _now_iso()
-    # Create timeout_at in ISO format ending with Z (UTC)
+    # Create timeout_at in 5 minutes from now in ISO format ending with Z (UTC)
     timeout_at = (now + timedelta(minutes=5)).strftime("%Y-%m-%dT%H:%M:%SZ")
 
     # 1. Create run meta item FIRST to ensure it exists before events are published
@@ -361,7 +444,17 @@ def handler(event, context):
         f"[Seeder] Created run meta for testInstrumentRunId={test_instrument_run_id}"
     )
 
-    # 2. Publish test events to EventBridge AFTER meta item is created
+    # 2. create all expected events item in dynamo db
+    for event_def in events_defs:
+        event_id = uuid.uuid4().hex
+        event_item = {
+            "pk": f"run#{test_instrument_run_id}",
+            "sk": f"event#{event_id}",
+            "eventId": event_id,
+        }
+        table.put_item(Item=event_item)
+
+    # 3. Publish test events to EventBridge AFTER meta item is created
     published_count = _publish_test_events(
         test_instrument_run_id, effective_service_name, events_defs
     )
