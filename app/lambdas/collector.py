@@ -30,7 +30,7 @@ from typing import Any, Dict, Optional
 
 import boto3
 import logging
-import uuid
+from services.helper import get_instrumentRunIdMapping, now_iso, get_nested_value
 
 TABLE_NAME = os.environ["TABLE_NAME"]
 S3_BUCKET = os.environ["S3_BUCKET"]
@@ -41,10 +41,6 @@ s3 = boto3.client("s3")
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
-
-
-def _now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="seconds") + "Z"
 
 
 def _hash_payload(payload) -> str:
@@ -124,38 +120,14 @@ def _get_run_meta(test_instrument_run_id: str):
         return None
 
 
-def _get_nested_value(obj: Dict[str, Any], path: str) -> Any:
-    """
-    Get nested value from object using dot notation.
-    E.g., "detail.instrumentRunId" -> obj["detail"]["instrumentRunId"]
-    """
-    parts = path.split(".")
-    value = obj
-    for part in parts:
-        if isinstance(value, dict):
-            value = value.get(part)
-        else:
-            return None
-        if value is None:
-            return None
-    return value
-
-
 def _get_instrument_run_id(event: dict) -> str:
     """
     Get instrument run id from event.
     """
-    # get instrument run id from events-map.json
-    config_dir = os.path.join(os.path.dirname(__file__), "..", "config")
-    events_map_path = os.path.join(config_dir, "events-map.json")
-    with open(events_map_path, "r", encoding="utf-8") as f:
-        events_map = json.load(f)
-    instrumentRunIdMapping = events_map.get("instrumentRunIdMapping")
-    if not instrumentRunIdMapping:
-        return None
-    for detail_type, path in instrumentRunIdMapping.items():
-        if event.get("detail-type") == detail_type:
-            return _get_nested_value(event, path)
+    detail_type = event.get("detail-type")
+    path = get_instrumentRunIdMapping().get(detail_type)
+    if path:
+        return get_nested_value(event, path)
     return None
 
 
@@ -228,7 +200,7 @@ def handler(event, context):
     # Store full payload in S3 first (time-based path)
     s3_key = _store_event_payload(test_instrument_run_id, event)
     payload_hash = _hash_payload(event.get("detail"))
-    received_at = _now_iso()
+    received_at = now_iso()
 
     # Generate sort key: event#{timestamp}-{eventId}
     # Use microsecond precision for uniqueness

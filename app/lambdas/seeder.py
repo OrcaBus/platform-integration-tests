@@ -18,6 +18,11 @@ import time
 import random
 import boto3
 from botocore.exceptions import ClientError
+from services.helper import (
+    resolve_service_name,
+    get_s3_keys_for_service,
+    set_nested_field,
+)
 
 TABLE_NAME = os.environ["TABLE_NAME"]
 EVENT_BUS_NAME = os.environ["EVENT_BUS_NAME"]
@@ -37,20 +42,6 @@ def _now_iso() -> str:
         datetime.now(tz=timezone.utc)
         .isoformat(timespec="seconds")
         .replace("+00:00", "Z")
-    )
-
-
-def _s3_keys_for_service(service_name: str) -> Tuple[str, str]:
-    """
-    Return (seeds_key, expectations_key) for a given serviceName.
-    Layout:
-      seed/services/{serviceName}/seeds.json
-      seed/services/{serviceName}/expectations.json
-    """
-    base_prefix = f"seed/services/{service_name}/"
-    return (
-        base_prefix + "seeds.json",
-        base_prefix + "expectations.json",
     )
 
 
@@ -80,7 +71,7 @@ def _load_service_seed_definitions(
     Returns (events, effective_service_name).
     """
     requested_service_name = service_name
-    seeds_key, _ = _s3_keys_for_service(requested_service_name)
+    seeds_key, _ = get_s3_keys_for_service(requested_service_name)
 
     try:
         seeds = _load_s3_json_list(S3_BUCKET, seeds_key)
@@ -101,41 +92,9 @@ def _load_service_seed_definitions(
             "Seed definitions for serviceName=%s not found, falling back to 'all'",
             requested_service_name,
         )
-        seeds_key, _ = _s3_keys_for_service("all")
+        seeds_key, _ = get_s3_keys_for_service("all")
         seeds = _load_s3_json_list(S3_BUCKET, seeds_key)
         return seeds, "all"
-
-
-def _deep_replace_in_dict(obj: Any, old_value: str, new_value: str) -> Any:
-    """
-    Recursively replace all occurrences of old_value with new_value in a nested dict/list structure.
-    """
-    if isinstance(obj, dict):
-        return {
-            k: _deep_replace_in_dict(v, old_value, new_value) for k, v in obj.items()
-        }
-    elif isinstance(obj, list):
-        return [_deep_replace_in_dict(item, old_value, new_value) for item in obj]
-    elif isinstance(obj, str):
-        return obj.replace(old_value, new_value)
-    else:
-        return obj
-
-
-def _set_nested_field(obj: Dict[str, Any], path: str, value: Any) -> None:
-    """
-    Set a nested field value using dot-notation path (e.g., "detail.icaEvent.id").
-    Creates intermediate dictionaries if they don't exist.
-    """
-    parts = path.split(".")
-    current = obj
-    for part in parts[:-1]:
-        if part not in current:
-            current[part] = {}
-        elif not isinstance(current[part], dict):
-            current[part] = {}
-        current = current[part]
-    current[parts[-1]] = value
 
 
 def _apply_format(value: str, format_config: Optional[Dict[str, str]]) -> str:
@@ -254,11 +213,11 @@ def _publish_test_events(
                             format_config = field_config.get("format")
                             if field_path:
                                 value = _apply_format(random_unique_id, format_config)
-                                _set_nested_field(event_copy, field_path, value)
+                                set_nested_field(event_copy, field_path, value)
                         elif isinstance(field_config, str):
                             # Simple string path
                             value = random_unique_id
-                            _set_nested_field(event_copy, field_config, value)
+                            set_nested_field(event_copy, field_config, value)
 
             # Process testInstrumentRunIdField
             if "testInstrumentRunIdField" in replace_config:
@@ -271,11 +230,11 @@ def _publish_test_events(
                             format_config = field_config.get("format")
                             if field_path:
                                 value = _apply_format(instrument_run_id, format_config)
-                                _set_nested_field(event_copy, field_path, value)
+                                set_nested_field(event_copy, field_path, value)
                         elif isinstance(field_config, str):
                             # Simple string path
                             value = instrument_run_id
-                            _set_nested_field(event_copy, field_config, value)
+                            set_nested_field(event_copy, field_config, value)
 
             # Process timeStampField
             if "timeStampField" in replace_config:
@@ -283,7 +242,7 @@ def _publish_test_events(
                 if isinstance(timestamp_fields, list):
                     for field_path in timestamp_fields:
                         if isinstance(field_path, str):
-                            _set_nested_field(event_copy, field_path, current_timestamp)
+                            set_nested_field(event_copy, field_path, current_timestamp)
 
         # Remove __replace field from the event before publishing
         event_copy.pop("__replace", None)
@@ -335,36 +294,6 @@ def _publish_test_events(
     return published_count
 
 
-def _resolve_service_name(raw_service_name: Optional[str]) -> Tuple[str, str]:
-    """
-    Normalise the serviceName:
-    - None or "all" -> "all"
-    - otherwise: lowercased string, used as folder name.
-    """
-    if raw_service_name is None or str(raw_service_name).lower() == "all":
-        return "all", "ALL"
-
-    try:
-        # get service name abbreviation from local events-map.json
-        config_dir = os.path.join(os.path.dirname(__file__), "..", "config")
-        events_map_path = os.path.join(config_dir, "events-map.json")
-        with open(events_map_path, "r", encoding="utf-8") as f:
-            events_map = json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError) as e:
-        logger.error(f"Error loading events-map.json: {e}")
-        raise
-
-    if raw_service_name not in events_map["abbreviations"]:
-        logger.error(
-            f"Service name {raw_service_name} not supported for current integration test."
-        )
-        raise ValueError(
-            f"Service name {raw_service_name} not supported for current integration test."
-        )
-
-    return str(raw_service_name).lower(), events_map["abbreviations"][raw_service_name]
-
-
 def _generate_test_instrument_run_id(service_name_abbreviation: str) -> str:
     """
     Generate a test run id (instrumentRunId) in the format
@@ -394,11 +323,11 @@ def handler(event, context):
     print(f"[Seeder] Event: {json.dumps(event)}")
 
     # retrieve payload from event
-    payload = event.get("payload")
+    payload = event.get("Payload") or event.get("payload")
     if not payload:
         raise ValueError("payload is required")
     raw_service_name = payload.get("serviceName", "all")
-    requested_service_name, service_name_abbreviation = _resolve_service_name(
+    requested_service_name, service_name_abbreviation = resolve_service_name(
         raw_service_name
     )
 
@@ -444,15 +373,15 @@ def handler(event, context):
         f"[Seeder] Created run meta for testInstrumentRunId={test_instrument_run_id}"
     )
 
-    # 2. create all expected events item in dynamo db
-    for event_def in events_defs:
-        event_id = uuid.uuid4().hex
-        event_item = {
-            "pk": f"run#{test_instrument_run_id}",
-            "sk": f"event#{event_id}",
-            "eventId": event_id,
-        }
-        table.put_item(Item=event_item)
+    # # 2. create all expected events item in dynamo db
+    # for event_def in events_defs:
+    #     event_id = uuid.uuid4().hex
+    #     event_item = {
+    #         "testId": f"run#{test_instrument_run_id}",
+    #         "sk": f"event#{event_id}",
+    #         "eventId": event_id,
+    #     }
+    #     table.put_item(Item=event_item)
 
     # 3. Publish test events to EventBridge AFTER meta item is created
     published_count = _publish_test_events(

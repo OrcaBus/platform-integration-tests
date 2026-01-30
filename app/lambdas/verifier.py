@@ -38,6 +38,7 @@ import logging
 import boto3
 from boto3.dynamodb.conditions import Key, Attr
 from botocore.exceptions import ClientError
+from services.helper import set_nested_field, now_iso
 
 TABLE_NAME = os.environ["TABLE_NAME"]
 S3_BUCKET = os.environ["S3_BUCKET"]
@@ -48,10 +49,6 @@ s3_client = boto3.client("s3")
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
-
-
-def _now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="seconds") + "Z"
 
 
 def _parse_iso(dt_str: str):
@@ -158,22 +155,6 @@ def _get_nested_value(obj: Dict[str, Any], path: str) -> Any:
     return value
 
 
-def _set_nested_field(obj: Dict[str, Any], path: str, value: Any) -> None:
-    """
-    Set a nested field value using dot-notation path (e.g., "detail.instrumentRunId").
-    Creates intermediate dictionaries if they don't exist.
-    """
-    parts = path.split(".")
-    current = obj
-    for part in parts[:-1]:
-        if part not in current:
-            current[part] = {}
-        elif not isinstance(current[part], dict):
-            current[part] = {}
-        current = current[part]
-    current[parts[-1]] = value
-
-
 def _apply_format(value: str, format_config: Optional[Dict[str, str]]) -> str:
     """
     Apply prefix and/or suffix formatting to a value based on format configuration.
@@ -216,11 +197,11 @@ def _process_replace_fields(
                     format_config = field_config.get("format")
                     if field_path:
                         value = _apply_format(test_instrument_run_id, format_config)
-                        _set_nested_field(processed, field_path, value)
+                        set_nested_field(processed, field_path, value)
                 elif isinstance(field_config, str):
                     # Simple string path
                     value = test_instrument_run_id
-                    _set_nested_field(processed, field_config, value)
+                    set_nested_field(processed, field_config, value)
 
     # Process timeStampField (if needed in future)
     if "timeStampField" in replace_config:
@@ -233,7 +214,7 @@ def _process_replace_fields(
         if isinstance(timestamp_fields, list):
             for field_path in timestamp_fields:
                 if isinstance(field_path, str):
-                    _set_nested_field(processed, field_path, current_timestamp)
+                    set_nested_field(processed, field_path, current_timestamp)
 
     # Remove __replace field after processing
     processed.pop("__replace", None)
@@ -331,6 +312,9 @@ def _status_mode(test_instrument_run_id: str) -> dict:
         expectations_key = f"seed/services/{service_name}/expectations.json"
         expectations = _load_s3_json_list(S3_BUCKET, expectations_key)
         expected_count = len(expectations)
+        logger.info(
+            f"[Verifier/Status] Loaded {expected_count} expectations for serviceName={service_name}"
+        )
     except Exception as e:
         print(f"[Verifier/Status] Could not load expectations to get count: {e}")
 
@@ -341,6 +325,9 @@ def _status_mode(test_instrument_run_id: str) -> dict:
             & Key("sk").begins_with("event#")
         )
         observed_count = len(resp.get("Items", []))
+        logger.info(
+            f"[Verifier/Status] Found {observed_count} observed events for testInstrumentRunId={test_instrument_run_id}"
+        )
     except Exception as e:
         print(f"[Verifier/Status] Could not count observed events: {e}")
         observed_count = 0
@@ -474,7 +461,7 @@ def _verify_mode(test_instrument_run_id: str) -> dict:
     except Exception as e:
         raise ValueError(f"Failed to load expectations from S3: {e}")
 
-    verifier_at = _now_iso()
+    verifier_at = now_iso()
     matched_count = 0
     missing_count = 0
     matched_event_keys = []  # Track which events were matched
