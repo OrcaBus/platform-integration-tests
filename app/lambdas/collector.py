@@ -31,7 +31,6 @@ from services.utils import get_instrumentRunIdMapping, now_iso, get_nested_value
 from services.dynamodb import get_run_meta, put_item_to_dynamodb
 from services.s3 import store_item_to_s3, S3_BUCKET
 
-
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 

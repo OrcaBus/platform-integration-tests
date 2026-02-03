@@ -24,7 +24,6 @@ from services.dynamodb import put_item_to_dynamodb
 from services.s3 import get_item_from_s3, S3_BUCKET
 from services.eventbridge import put_event_to_event_bus, EVENT_BUS_NAME
 
-
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 

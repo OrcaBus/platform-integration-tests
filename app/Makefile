@@ -1,5 +1,4 @@
 install:
-
 	pip install -r deps/requirements.txt
 
 install-test:
@@ -31,9 +30,9 @@ lint:
 lint-fix:
 	@python3 -m black -t py312 . --exclude .venv
 
-check: lint
+check: install-test lint
 
-fix: lint-fix
+fix: install-test lint-fix
 
 .PHONY: help
 help:

@@ -24,13 +24,11 @@ os.environ["AWS_SESSION_TOKEN"] = "test-session-token"
 # Create a temporary credentials file with complete dummy credentials
 # This prevents boto3 from loading partial credentials from actual credential files
 _temp_creds_file = tempfile.NamedTemporaryFile(mode="w", delete=False, suffix=".ini")
-_temp_creds_file.write(
-    """[default]
+_temp_creds_file.write("""[default]
 aws_access_key_id = test-access-key
 aws_secret_access_key = test-secret-key
 aws_session_token = test-session-token
-"""
-)
+""")
 _temp_creds_file.close()
 os.environ["AWS_SHARED_CREDENTIALS_FILE"] = _temp_creds_file.name
 

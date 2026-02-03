@@ -13,3 +13,5 @@ boto3>=1.34.0
 
 # Note: unittest.mock is part of Python standard library (Python 3.3+)
 # No need to install separately
+
+black>=3.12.0
