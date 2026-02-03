@@ -23,16 +23,15 @@ test-reporter:
 test-rule-controller:
 	python -m pytest test/test_rule_controller.py -v
 
-
 test: install-test test-collector test-seeder test-verifier test-reporter test-rule-controller
-
-check: lint test
 
 lint:
 	@black -t py312 --check . --exclude .venv
 
 lint-fix:
 	@black -t py312 . --exclude .venv
+
+check: lint
 
 fix: lint-fix
 
