@@ -71,6 +71,13 @@ jobs:
         run: |
           make install
 
+      - name: Install Python dependencies for app
+        working-directory: ./app
+        run: |
+          pip3 install -r deps/requirements.txt
+          # Verify black is available
+          python3 -m black --version
+
       - name: Lint and code formatting
         run: |
           make check-all
@@ -119,7 +126,7 @@ jobs:
         run: |
           make install
 
-      # - name: Test
-      #   working-directory: ./app
-      #   run: |
-      #     make test
+      - name: Test
+        working-directory: ./app
+        run: |
+          make test

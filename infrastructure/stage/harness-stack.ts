@@ -117,7 +117,7 @@ export class IntegrationTestsHarnessStack extends Stack {
   }
   private createPythonFunction(name: string, props: object): PythonFunction {
     return new PythonFunction(this, name, {
-      entry: path.join(__dirname, '../../app/service/'),
+      entry: path.join(__dirname, '../../app/'),
       runtime: this.lambdaRuntimePythonVersion,
       layers: [this.baseLayer],
       environment: this.lambdaEnv,
@@ -131,7 +131,7 @@ export class IntegrationTestsHarnessStack extends Stack {
 
   private createSeederFunction(): PythonFunction {
     return this.createPythonFunction('Seeder', {
-      index: 'seeder.py',
+      index: 'lambdas/seeder.py',
       handler: 'handler',
       timeout: Duration.seconds(300),
     });
@@ -139,7 +139,7 @@ export class IntegrationTestsHarnessStack extends Stack {
 
   private createCollectorFunction(): PythonFunction {
     return this.createPythonFunction('Collector', {
-      index: 'collector.py',
+      index: 'lambdas/collector.py',
       handler: 'handler',
       timeout: Duration.seconds(300),
     });
@@ -168,7 +168,7 @@ export class IntegrationTestsHarnessStack extends Stack {
 
   private createRuleControllerFunction(): PythonFunction {
     return this.createPythonFunction('RuleController', {
-      index: 'rule_controller.py',
+      index: 'lambdas/rule_controller.py',
       handler: 'handler',
       timeout: Duration.seconds(60),
       // override base env to add RULE_NAME for this function
@@ -181,14 +181,14 @@ export class IntegrationTestsHarnessStack extends Stack {
 
   private createVerifierFunction(): PythonFunction {
     return this.createPythonFunction('Verifier', {
-      index: 'verifier.py',
+      index: 'lambdas/verifier.py',
       handler: 'handler',
       timeout: Duration.seconds(300),
     });
   }
   private createReporterFunction(): PythonFunction {
     return this.createPythonFunction('Reporter', {
-      index: 'reporter.py',
+      index: 'lambdas/reporter.py',
       handler: 'handler',
       timeout: Duration.seconds(300),
     });
