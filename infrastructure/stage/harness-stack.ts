@@ -75,6 +75,7 @@ export class IntegrationTestsHarnessStack extends Stack {
       EVENT_BUS_NAME: this.mainBus.eventBusName,
       TABLE_NAME: props.dynamoDBTableName,
       S3_BUCKET: props.s3BucketName,
+      RULE_NAME: this.serviceName + 'CollectorEventRule',
     };
 
     this.baseLayer = new PythonLayerVersion(this, this.stackName + 'BaseLayer', {
@@ -171,11 +172,6 @@ export class IntegrationTestsHarnessStack extends Stack {
       index: 'lambdas/rule_controller.py',
       handler: 'handler',
       timeout: Duration.seconds(60),
-      // override base env to add RULE_NAME for this function
-      environment: {
-        ...this.lambdaEnv,
-        RULE_NAME: this.serviceName + 'CollectorEventRule',
-      },
     });
   }
 
