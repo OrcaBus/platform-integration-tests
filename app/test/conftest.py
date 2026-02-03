@@ -18,7 +18,7 @@ os.environ.setdefault("RULE_NAME", "test-rule")
 # These are only used during import - actual tests will use mocked clients
 # Use explicit values (not setdefault) to override any existing partial credentials
 os.environ["AWS_ACCESS_KEY_ID"] = "test-access-key"
-os.environ["AWS_SECRET_ACCESS_KEY"] = "test-secret-key" # pragma: allowlist secret
+os.environ["AWS_SECRET_ACCESS_KEY"] = "test-secret-key"  # pragma: allowlist secret
 os.environ["AWS_SESSION_TOKEN"] = "test-session-token"
 
 # Create a temporary credentials file with complete dummy credentials

@@ -25,7 +25,7 @@ os.environ.setdefault("RULE_NAME", "test-rule")
 if "AWS_ACCESS_KEY_ID" not in os.environ:
     os.environ["AWS_ACCESS_KEY_ID"] = "test-access-key"
 if "AWS_SECRET_ACCESS_KEY" not in os.environ:
-    os.environ["AWS_SECRET_ACCESS_KEY"] = "test-secret-key" # pragma: allowlist secret
+    os.environ["AWS_SECRET_ACCESS_KEY"] = "test-secret-key"  # pragma: allowlist secret
 if "AWS_SESSION_TOKEN" not in os.environ:
     os.environ["AWS_SESSION_TOKEN"] = "test-session-token"
 
