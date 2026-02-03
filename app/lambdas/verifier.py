@@ -94,14 +94,27 @@ def _get_observed_events(
 
     Args:
         test_instrument_run_id: The test instrument run ID (format: "YYMMDD_A00001_XXXX_TESTXXXXXX")
-        detail_type: The event detail type
-        source: The event source
+        detail_type: The event detail type (empty string to get all events)
+        source: The event source (empty string to get all events)
     """
-    return get_items_from_dynamodb(
-        KeyConditionExpression=Key("testId").eq(f"run#{test_instrument_run_id}")
-        & Key("sk").begins_with("event#"),
-        FilterExpression=Attr("detailType").eq(detail_type) & Attr("source").eq(source),
-    )
+    key_condition = Key("testId").eq(f"run#{test_instrument_run_id}") & Key(
+        "sk"
+    ).begins_with("event#")
+
+    # Only apply filter if both detail_type and source are provided (non-empty)
+    if detail_type and source:
+        filter_expression = Attr("detailType").eq(detail_type) & Attr("source").eq(
+            source
+        )
+        return get_items_from_dynamodb(
+            KeyConditionExpression=key_condition,
+            FilterExpression=filter_expression,
+        )
+    else:
+        # No filter - return all events for this test run
+        return get_items_from_dynamodb(
+            KeyConditionExpression=key_condition,
+        )
 
 
 def _get_nested_value(obj: Dict[str, Any], path: str) -> Any:
