@@ -201,6 +201,7 @@ class SeederTests(LambdaTestCase):
     def test_publish_test_events(self):
         """Test publishing test events."""
         test_instrument_run_id = "260122_A00001_1234_TEST123456"
+        test_sequence_run_id = "test-abcdefghijklmnopqrstuvwxyz"
         service_name = "all"
         events_definitions = [
             {
@@ -227,7 +228,10 @@ class SeederTests(LambdaTestCase):
         ):  # Mock sleep to speed up tests
 
             count = seeder._publish_test_events(
-                test_instrument_run_id, service_name, events_definitions
+                test_instrument_run_id,
+                test_sequence_run_id,
+                service_name,
+                events_definitions,
             )
 
         # Verify both events were published
@@ -249,6 +253,7 @@ class SeederTests(LambdaTestCase):
     def test_publish_test_events_with_timestamp_replacement(self):
         """Test publishing events with timestamp replacement."""
         test_instrument_run_id = "260122_A00001_1234_TEST123456"
+        test_sequence_run_id = "test-sequence-run-id-12345"
         service_name = "all"
         events_definitions = [
             {
@@ -269,7 +274,10 @@ class SeederTests(LambdaTestCase):
         ):
 
             count = seeder._publish_test_events(
-                test_instrument_run_id, service_name, events_definitions
+                test_instrument_run_id,
+                test_sequence_run_id,
+                service_name,
+                events_definitions,
             )
 
         self.assertEqual(count, 1)
@@ -281,6 +289,7 @@ class SeederTests(LambdaTestCase):
     def test_publish_test_events_with_random_unique_id(self):
         """Test publishing events with random unique ID replacement."""
         test_instrument_run_id = "260122_A00001_1234_TEST123456"
+        test_sequence_run_id = "test-sequence-run-id-12345"
         service_name = "all"
         events_definitions = [
             {
@@ -301,7 +310,10 @@ class SeederTests(LambdaTestCase):
         ):
 
             count = seeder._publish_test_events(
-                test_instrument_run_id, service_name, events_definitions
+                test_instrument_run_id,
+                test_sequence_run_id,
+                service_name,
+                events_definitions,
             )
 
         self.assertEqual(count, 1)
@@ -315,6 +327,7 @@ class SeederTests(LambdaTestCase):
     def test_publish_test_events_removes_replace_field(self):
         """Test that __replace field is removed before publishing."""
         test_instrument_run_id = "260122_A00001_1234_TEST123456"
+        test_sequence_run_id = "test-sequence-run-id-12345"
         service_name = "all"
         events_definitions = [
             {
@@ -333,7 +346,10 @@ class SeederTests(LambdaTestCase):
         ):
 
             seeder._publish_test_events(
-                test_instrument_run_id, service_name, events_definitions
+                test_instrument_run_id,
+                test_sequence_run_id,
+                service_name,
+                events_definitions,
             )
 
         call_args = mock_put_event.call_args[0][0]

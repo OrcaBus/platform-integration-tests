@@ -102,6 +102,7 @@ def _apply_format(value: str, format_config: Optional[Dict[str, str]]) -> str:
 
 def _publish_test_events(
     instrument_run_id: str,
+    sequence_run_id: str,
     service_name: str,
     events_definitions: List[Dict[str, Any]],
 ) -> int:
@@ -159,7 +160,7 @@ def _publish_test_events(
 
     for idx, ev in enumerate(events_definitions):
         # Generate a new random unique ID for each event (used for randomUniqueIdField)
-        random_unique_id = uuid.uuid4().hex
+        random_unique_id = sequence_run_id
 
         # Deep copy the event to avoid modifying the original
         event_copy = json.loads(json.dumps(ev))
@@ -319,6 +320,8 @@ def handler(event, context):
 
     # random generate test instrument run id for the test run
     test_instrument_run_id = _generate_test_instrument_run_id(service_name_abbreviation)
+    # generate a random unique id for the test run
+    test_sequence_run_id = uuid.uuid4().hex
 
     logger.info(
         "Starting seeding for testInstrumentRunId=%s, requestedServiceName=%s",
@@ -371,7 +374,10 @@ def handler(event, context):
 
     # 3. Publish test events to EventBridge AFTER meta item is created
     published_count = _publish_test_events(
-        test_instrument_run_id, effective_service_name, events_defs
+        test_instrument_run_id,
+        test_sequence_run_id,
+        effective_service_name,
+        events_defs,
     )
 
     return {
