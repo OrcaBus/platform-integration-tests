@@ -26,10 +26,10 @@ test-rule-controller:
 test: install-test test-collector test-seeder test-verifier test-reporter test-rule-controller
 
 lint:
-	@black -t py312 --check . --exclude .venv
+	@python3 -m black -t py312 --check . --exclude .venv
 
 lint-fix:
-	@black -t py312 . --exclude .venv
+	@python3 -m black -t py312 . --exclude .venv
 
 check: lint
 
