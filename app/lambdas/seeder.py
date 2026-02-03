@@ -374,7 +374,10 @@ def handler(event, context):
 
     # 3. Publish test events to EventBridge AFTER meta item is created
     published_count = _publish_test_events(
-        test_instrument_run_id, test_sequence_run_id, effective_service_name, events_defs
+        test_instrument_run_id,
+        test_sequence_run_id,
+        effective_service_name,
+        events_defs,
     )
 
     return {

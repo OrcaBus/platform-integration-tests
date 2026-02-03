@@ -228,7 +228,10 @@ class SeederTests(LambdaTestCase):
         ):  # Mock sleep to speed up tests
 
             count = seeder._publish_test_events(
-                test_instrument_run_id, test_sequence_run_id, service_name, events_definitions
+                test_instrument_run_id,
+                test_sequence_run_id,
+                service_name,
+                events_definitions,
             )
 
         # Verify both events were published
@@ -271,7 +274,10 @@ class SeederTests(LambdaTestCase):
         ):
 
             count = seeder._publish_test_events(
-                test_instrument_run_id, test_sequence_run_id, service_name, events_definitions
+                test_instrument_run_id,
+                test_sequence_run_id,
+                service_name,
+                events_definitions,
             )
 
         self.assertEqual(count, 1)
@@ -304,7 +310,10 @@ class SeederTests(LambdaTestCase):
         ):
 
             count = seeder._publish_test_events(
-                test_instrument_run_id, test_sequence_run_id, service_name, events_definitions
+                test_instrument_run_id,
+                test_sequence_run_id,
+                service_name,
+                events_definitions,
             )
 
         self.assertEqual(count, 1)
@@ -337,7 +346,10 @@ class SeederTests(LambdaTestCase):
         ):
 
             seeder._publish_test_events(
-                test_instrument_run_id, test_sequence_run_id, service_name, events_definitions
+                test_instrument_run_id,
+                test_sequence_run_id,
+                service_name,
+                events_definitions,
             )
 
         call_args = mock_put_event.call_args[0][0]
