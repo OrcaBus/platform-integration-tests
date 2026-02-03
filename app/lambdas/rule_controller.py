@@ -1,16 +1,10 @@
-import os
 import logging
 from typing import Any, Dict
 
-import boto3
+from services.eventbridge import events_client, RULE_NAME, EVENT_BUS_NAME
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
-
-events_client = boto3.client("events")
-
-RULE_NAME = os.environ["RULE_NAME"]
-EVENT_BUS_NAME = os.environ["EVENT_BUS_NAME"]
 
 
 def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:

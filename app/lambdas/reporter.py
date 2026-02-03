@@ -23,25 +23,21 @@ Note: testInstrumentRunId format is "YYMMDD_A00001_XXXX_TESTXXXXXX" (e.g., "2601
 
 import json
 import logging
-import os
 from datetime import datetime, timezone
 from typing import Any, Dict, List
 from urllib.parse import quote
 
-import boto3
 from boto3.dynamodb.conditions import Key, Attr
-from botocore.exceptions import ClientError
 from services.reporter_template import load_reporter_template
+from services.dynamodb import (
+    get_run_meta,
+    get_items_from_dynamodb,
+    update_item_in_dynamodb,
+)
+from services.s3 import S3_BUCKET, store_item_to_s3
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
-
-TABLE_NAME = os.environ["TABLE_NAME"]
-S3_BUCKET = os.environ["S3_BUCKET"]
-
-dynamodb = boto3.resource("dynamodb")
-table = dynamodb.Table(TABLE_NAME)
-s3_client = boto3.client("s3")
 
 
 def _safe_timestamp_filename(dt: datetime) -> str:
@@ -67,19 +63,6 @@ def _render_template(template: str, context: Dict[str, Any]) -> str:
     return html
 
 
-def _get_run_meta(test_instrument_run_id: str) -> Dict[str, Any]:
-    """
-    Get run meta from DynamoDB.
-
-    Args:
-        test_instrument_run_id: The test instrument run ID (format: "YYMMDD_A00001_XXXX_TESTXXXXXX")
-    """
-    resp = table.get_item(
-        Key={"testId": f"run#{test_instrument_run_id}", "sk": "run#meta"}
-    )
-    return resp.get("Item", {})
-
-
 def _get_matched_events(test_instrument_run_id: str) -> List[Dict[str, Any]]:
     """
     Get all matched events (status=matched) for this run.
@@ -88,12 +71,11 @@ def _get_matched_events(test_instrument_run_id: str) -> List[Dict[str, Any]]:
         test_instrument_run_id: The test instrument run ID (format: "YYMMDD_A00001_XXXX_TESTXXXXXX")
     """
     try:
-        resp = table.query(
+        items = get_items_from_dynamodb(
             KeyConditionExpression=Key("testId").eq(f"run#{test_instrument_run_id}")
             & Key("sk").begins_with("event#"),
             FilterExpression=Attr("status").eq("matched"),
         )
-        items = resp.get("Items", [])
         # Sort by expectedOrder
         items.sort(key=lambda x: x.get("expectedOrder", 999))
         return items
@@ -110,12 +92,11 @@ def _get_missing_events(test_instrument_run_id: str) -> List[Dict[str, Any]]:
         test_instrument_run_id: The test instrument run ID (format: "YYMMDD_A00001_XXXX_TESTXXXXXX")
     """
     try:
-        resp = table.query(
+        items = get_items_from_dynamodb(
             KeyConditionExpression=Key("testId").eq(f"run#{test_instrument_run_id}")
             & Key("sk").begins_with("expectation#"),
             FilterExpression=Attr("status").eq("missed"),
         )
-        items = resp.get("Items", [])
         # Sort by expectedOrder
         items.sort(key=lambda x: x.get("expectedOrder", 999))
         return items
@@ -132,12 +113,11 @@ def _get_unexpected_events(test_instrument_run_id: str) -> List[Dict[str, Any]]:
         test_instrument_run_id: The test instrument run ID (format: "YYMMDD_A00001_XXXX_TESTXXXXXX")
     """
     try:
-        resp = table.query(
+        items = get_items_from_dynamodb(
             KeyConditionExpression=Key("testId").eq(f"run#{test_instrument_run_id}")
             & Key("sk").begins_with("event#"),
             FilterExpression=Attr("status").eq("unexpected"),
         )
-        items = resp.get("Items", [])
         # Sort by receivedAt
         items.sort(key=lambda x: x.get("receivedAt", ""))
         return items
@@ -235,7 +215,7 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     verify_result = event.get("verifyResult", {})
 
     # Load run meta to get additional details
-    run_meta = _get_run_meta(test_instrument_run_id)
+    run_meta = get_run_meta(test_instrument_run_id)
     service_name = run_meta.get("serviceName") or event.get("serviceName", "all")
     started_at = run_meta.get("startedAt", "")
     verified_at = run_meta.get("verifiedAt", "")
@@ -253,7 +233,7 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
 
     # reports/testruns/{serviceName}/year={YYYY}/month={MM}/day={DD}/{timestamp}-{testInstrumentRunId}.html
     key = (
-        f"reports/{service_name}/"
+        f"reports/testruns/{service_name}/{test_instrument_run_id}/"
         f"year={yyyy}/month={mm}/day={dd}/"
         f"{ts_for_filename}-{test_instrument_run_id}.html"
     )
@@ -298,16 +278,14 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
 
     html = _render_template(template, context)
 
-    s3_client.put_object(
-        Bucket=S3_BUCKET,
-        Key=key,
-        Body=html.encode("utf-8"),
-        ContentType="text/html",
+    store_item_to_s3(
+        key=key,
+        body=html,
     )
 
     # Update run meta with reportS3Key
     try:
-        table.update_item(
+        update_item_in_dynamodb(
             Key={"testId": f"run#{test_instrument_run_id}", "sk": "run#meta"},
             UpdateExpression="SET reportS3Key = :key",
             ExpressionAttributeValues={":key": key},

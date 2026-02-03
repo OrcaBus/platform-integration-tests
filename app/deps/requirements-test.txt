@@ -1,0 +1,15 @@
+# Test dependencies for Lambda function unit tests
+-r requirements.txt
+
+# Test framework
+pytest>=7.4.0
+pytest-cov>=4.1.0  # Optional: for coverage reports
+
+# Mocking libraries
+mockito>=1.4.0  # Advanced mocking library (similar to Django test style)
+
+# AWS SDK (already in requirements.txt, but listed for completeness)
+boto3>=1.34.0
+
+# Note: unittest.mock is part of Python standard library (Python 3.3+)
+# No need to install separately

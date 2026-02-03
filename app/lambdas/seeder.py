@@ -7,31 +7,23 @@ Seeder Lambda Function
 - Emit initial seed event to EventBridge (testMode=True, testId=runId)
 """
 
-import os
 import json
 import logging
-import re
 from typing import Optional, List, Dict, Any, Tuple
 import uuid
 from datetime import datetime, timedelta, timezone
 import time
 import random
-import boto3
 from botocore.exceptions import ClientError
-from services.helper import (
+from services.utils import (
     resolve_service_name,
     get_s3_keys_for_service,
     set_nested_field,
 )
+from services.dynamodb import put_item_to_dynamodb
+from services.s3 import get_item_from_s3, S3_BUCKET
+from services.eventbridge import put_event_to_event_bus, EVENT_BUS_NAME
 
-TABLE_NAME = os.environ["TABLE_NAME"]
-EVENT_BUS_NAME = os.environ["EVENT_BUS_NAME"]
-S3_BUCKET = os.environ["S3_BUCKET"]
-
-dynamodb = boto3.resource("dynamodb")
-table = dynamodb.Table(TABLE_NAME)
-events_client = boto3.client("events")
-s3_client = boto3.client("s3")
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
@@ -45,14 +37,13 @@ def _now_iso() -> str:
     )
 
 
-def _load_s3_json_list(bucket: str, key: str) -> List[Dict[str, Any]]:
+def _load_s3_json_list(key: str) -> List[Dict[str, Any]]:
     """
     Load JSON from S3 and ensure it's a list.
     If the object does not exist, raise ClientError with NoSuchKey.
     """
-    logger.info("Loading seed data from s3://%s/%s", bucket, key)
-    resp = s3_client.get_object(Bucket=bucket, Key=key)
-    raw = resp["Body"].read().decode("utf-8")
+    logger.info("Loading seed data from s3://%s/%s", S3_BUCKET, key)
+    raw = get_item_from_s3(key)
     data = json.loads(raw)
 
     if isinstance(data, list):
@@ -74,7 +65,7 @@ def _load_service_seed_definitions(
     seeds_key, _ = get_s3_keys_for_service(requested_service_name)
 
     try:
-        seeds = _load_s3_json_list(S3_BUCKET, seeds_key)
+        seeds = _load_s3_json_list(seeds_key)
         logger.info(
             "Loaded %d seeds for serviceName=%s", len(seeds), requested_service_name
         )
@@ -93,7 +84,7 @@ def _load_service_seed_definitions(
             requested_service_name,
         )
         seeds_key, _ = get_s3_keys_for_service("all")
-        seeds = _load_s3_json_list(S3_BUCKET, seeds_key)
+        seeds = _load_s3_json_list(seeds_key)
         return seeds, "all"
 
 
@@ -271,12 +262,7 @@ def _publish_test_events(
             detail_type,
         )
 
-        resp = events_client.put_events(Entries=[entry])
-        failed = resp.get("FailedEntryCount", 0)
-        if failed:
-            logger.error("Failed to publish test event %d: %s", idx + 1, resp)
-            raise RuntimeError("One or more events failed to publish")
-
+        put_event_to_event_bus(entry)
         published_count += 1
 
         # If there are more events to send, wait 1 second to simulate
@@ -320,11 +306,12 @@ def handler(event, context):
     - Create run#meta item
     - Emit seed events to EventBridge (testMode=true, testId=runId)
     """
-    print(f"[Seeder] Event: {json.dumps(event)}")
+    logger.info(f"[Seeder] Event: {json.dumps(event)}")
 
     # retrieve payload from event
     payload = event.get("Payload") or event.get("payload")
     if not payload:
+        logger.error("payload is required")
         raise ValueError("payload is required")
     raw_service_name = payload.get("serviceName", "all")
     requested_service_name, service_name_abbreviation = resolve_service_name(
@@ -368,7 +355,7 @@ def handler(event, context):
         "startedAt": started_at,
         "timeoutAt": timeout_at,
     }
-    table.put_item(Item=meta_item)
+    put_item_to_dynamodb(meta_item)
     logger.info(
         f"[Seeder] Created run meta for testInstrumentRunId={test_instrument_run_id}"
     )

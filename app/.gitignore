@@ -1,0 +1,17 @@
+# data folders
+data/
+
+# Python
+*__pycache__*
+
+# IDE
+.idea
+.DS_Store
+
+# Python environments
+.venv/
+env/
+.env
+
+.coverage
+htmlcov/

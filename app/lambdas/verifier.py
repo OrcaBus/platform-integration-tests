@@ -30,22 +30,18 @@ Note: testInstrumentRunId format is "YYMMDD_A00001_XXXX_TESTXXXXXX" (e.g., "2601
 """
 
 import json
-import os
-from collections import Counter
 from datetime import datetime, timezone
 from typing import Dict, Any, List, Optional
 import logging
-import boto3
 from boto3.dynamodb.conditions import Key, Attr
-from botocore.exceptions import ClientError
-from services.helper import set_nested_field, now_iso
-
-TABLE_NAME = os.environ["TABLE_NAME"]
-S3_BUCKET = os.environ["S3_BUCKET"]
-
-dynamodb = boto3.resource("dynamodb")
-table = dynamodb.Table(TABLE_NAME)
-s3_client = boto3.client("s3")
+from services.utils import set_nested_field, now_iso
+from services.dynamodb import (
+    get_item_from_dynamodb,
+    update_item_in_dynamodb,
+    get_items_from_dynamodb,
+    put_item_to_dynamodb,
+)
+from services.s3 import get_item_from_s3, S3_BUCKET
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
@@ -70,34 +66,23 @@ def _get_run_meta(test_instrument_run_id: str):
     Returns:
         The run meta item or None if not found.
     """
-    resp = table.get_item(
-        Key={"testId": f"run#{test_instrument_run_id}", "sk": "run#meta"}
+    return get_item_from_dynamodb(
+        {"testId": f"run#{test_instrument_run_id}", "sk": "run#meta"}
     )
-    item = resp.get("Item")
-    if item:
-        logger.info(
-            f"[Verifier] Successfully found run meta for testInstrumentRunId={test_instrument_run_id}"
-        )
-    else:
-        logger.error(
-            f"[Verifier] No run meta found for testInstrumentRunId={test_instrument_run_id}"
-        )
-    return item
 
 
-def _load_s3_json_list(bucket: str, key: str) -> List[Dict[str, Any]]:
+def _load_s3_json_list(key: str) -> List[Dict[str, Any]]:
     """Load JSON from S3 and ensure it's a list."""
     try:
-        resp = s3_client.get_object(Bucket=bucket, Key=key)
-        raw = resp["Body"].read().decode("utf-8")
-        data = json.loads(raw)
+        resp = get_item_from_s3(key)
+        data = json.loads(resp)
         if isinstance(data, list):
             return data
         else:
             raise ValueError(f"Seed file {key} must contain a JSON array")
-    except ClientError as e:
-        print(f"[Verifier] Failed to load {key} from S3: {e}")
-        raise
+    except Exception as e:
+        logger.error(f"[Verifier] Failed to load {key} from S3: {e}")
+        raise e
 
 
 def _get_observed_events(
@@ -112,30 +97,11 @@ def _get_observed_events(
         detail_type: The event detail type
         source: The event source
     """
-    try:
-        resp = table.query(
-            KeyConditionExpression=Key("testId").eq(f"run#{test_instrument_run_id}")
-            & Key("sk").begins_with("event#"),
-            FilterExpression=Attr("detailType").eq(detail_type)
-            & Attr("source").eq(source),
-        )
-        return resp.get("Items", [])
-    except Exception as e:
-        print(
-            f"[Verifier] Failed to query events for detailType={detail_type}, source={source}: {e}"
-        )
-        return []
-
-
-def _download_event_from_s3(s3_key: str) -> Optional[Dict[str, Any]]:
-    """Download and parse event JSON from S3."""
-    try:
-        resp = s3_client.get_object(Bucket=S3_BUCKET, Key=s3_key)
-        raw = resp["Body"].read().decode("utf-8")
-        return json.loads(raw)
-    except Exception as e:
-        print(f"[Verifier] Failed to download event from S3 key {s3_key}: {e}")
-        return None
+    return get_items_from_dynamodb(
+        KeyConditionExpression=Key("testId").eq(f"run#{test_instrument_run_id}")
+        & Key("sk").begins_with("event#"),
+        FilterExpression=Attr("detailType").eq(detail_type) & Attr("source").eq(source),
+    )
 
 
 def _get_nested_value(obj: Dict[str, Any], path: str) -> Any:
@@ -261,7 +227,7 @@ def _find_matching_event(
         if not s3_key:
             continue
 
-        event_body = _download_event_from_s3(s3_key)
+        event_body = json.loads(get_item_from_s3(s3_key))
         if not event_body:
             continue
 
@@ -310,7 +276,7 @@ def _status_mode(test_instrument_run_id: str) -> dict:
     # Try to load expectations to get expected count
     try:
         expectations_key = f"seed/services/{service_name}/expectations.json"
-        expectations = _load_s3_json_list(S3_BUCKET, expectations_key)
+        expectations = _load_s3_json_list(expectations_key)
         expected_count = len(expectations)
         logger.info(
             f"[Verifier/Status] Loaded {expected_count} expectations for serviceName={service_name}"
@@ -319,18 +285,8 @@ def _status_mode(test_instrument_run_id: str) -> dict:
         print(f"[Verifier/Status] Could not load expectations to get count: {e}")
 
     # Count observed events
-    try:
-        resp = table.query(
-            KeyConditionExpression=Key("testId").eq(f"run#{test_instrument_run_id}")
-            & Key("sk").begins_with("event#")
-        )
-        observed_count = len(resp.get("Items", []))
-        logger.info(
-            f"[Verifier/Status] Found {observed_count} observed events for testInstrumentRunId={test_instrument_run_id}"
-        )
-    except Exception as e:
-        print(f"[Verifier/Status] Could not count observed events: {e}")
-        observed_count = 0
+    observed_events = _get_observed_events(test_instrument_run_id, "", "")
+    observed_count = len(observed_events)
 
     current_status = meta.get("status", "running")
     timeout_at_str = meta.get("timeoutAt")
@@ -357,17 +313,17 @@ def _status_mode(test_instrument_run_id: str) -> dict:
                 )
                 if current_status != "timeout":
                     try:
-                        table.update_item(
-                            Key={"testId": meta["testId"], "sk": meta["sk"]},
+                        update_item_in_dynamodb(
+                            key={"testId": meta["testId"], "sk": meta["sk"]},
                             UpdateExpression="SET #s = :timeout",
                             ExpressionAttributeNames={"#s": "status"},
                             ExpressionAttributeValues={":timeout": "timeout"},
                         )
-                        print(f"[Verifier/Status] Updated run status to timeout")
                     except Exception as e:
                         print(
                             f"[Verifier/Status] Failed to set run status to timeout: {e}"
                         )
+                        raise e
                 return {
                     "status": "timeout",
                     "runId": test_instrument_run_id,
@@ -385,14 +341,15 @@ def _status_mode(test_instrument_run_id: str) -> dict:
         if observed_count >= expected_count:
             if current_status != "ready":
                 try:
-                    table.update_item(
-                        Key={"testId": meta["testId"], "sk": meta["sk"]},
+                    update_item_in_dynamodb(
+                        key={"testId": meta["testId"], "sk": meta["sk"]},
                         UpdateExpression="SET #s = :ready",
                         ExpressionAttributeNames={"#s": "status"},
                         ExpressionAttributeValues={":ready": "ready"},
                     )
                 except Exception as e:
                     print(f"[Verifier/Status] Failed to set run status to ready: {e}")
+                    raise e
             return {
                 "status": "ready",
                 "runId": test_instrument_run_id,
@@ -409,14 +366,15 @@ def _status_mode(test_instrument_run_id: str) -> dict:
             )
             if current_status != "ready":
                 try:
-                    table.update_item(
-                        Key={"testId": meta["testId"], "sk": meta["sk"]},
+                    update_item_in_dynamodb(
+                        key={"testId": meta["testId"], "sk": meta["sk"]},
                         UpdateExpression="SET #s = :ready",
                         ExpressionAttributeNames={"#s": "status"},
                         ExpressionAttributeValues={":ready": "ready"},
                     )
                 except Exception as e:
                     print(f"[Verifier/Status] Failed to set run status to ready: {e}")
+                    raise e
             return {
                 "status": "ready",
                 "runId": test_instrument_run_id,
@@ -454,7 +412,7 @@ def _verify_mode(test_instrument_run_id: str) -> dict:
 
     # Load expectations from S3
     try:
-        expectations = _load_s3_json_list(S3_BUCKET, expectations_key)
+        expectations = _load_s3_json_list(expectations_key)
         print(
             f"[Verifier/Verify] Loaded {len(expectations)} expectations for serviceName={service_name}"
         )
@@ -498,10 +456,9 @@ def _verify_mode(test_instrument_run_id: str) -> dict:
             matched_count += 1
             event_key = {"testId": matched_event["testId"], "sk": matched_event["sk"]}
             matched_event_keys.append(event_key)
-
             try:
-                table.update_item(
-                    Key=event_key,
+                update_item_in_dynamodb(
+                    key=event_key,
                     UpdateExpression="SET #s = :status, verifiedAt = :verifiedAt, expectedOrder = :order, expectedEvent = :expected",
                     ExpressionAttributeNames={"#s": "status"},
                     ExpressionAttributeValues={
@@ -511,44 +468,33 @@ def _verify_mode(test_instrument_run_id: str) -> dict:
                         ":expected": processed_expected,
                     },
                 )
-                print(
-                    f"[Verifier/Verify] Matched expectation {idx}: detailType={detail_type}, source={source}"
-                )
             except Exception as e:
-                print(
-                    f"[Verifier/Verify] Failed to update matched event {event_key}: {e}"
-                )
+                print(f"[Verifier/Verify] Failed to update matched event: {e}")
+                raise e
         else:
             # Write missing event item to DynamoDB
             missing_count += 1
             missing_sk = f"expectation#{idx:03d}-missing"
 
-            try:
-                missing_item = {
-                    "testId": f"run#{test_instrument_run_id}",
-                    "sk": missing_sk,
-                    "detailType": detail_type,
-                    "source": source,
-                    "expectedEvent": processed_expected,
-                    "status": "missed",
-                    "verifiedAt": verifier_at,
-                    "expectedOrder": idx,
-                }
-                table.put_item(Item=missing_item)
-                print(
-                    f"[Verifier/Verify] Missing expectation {idx}: detailType={detail_type}, source={source}"
-                )
-            except Exception as e:
-                print(f"[Verifier/Verify] Failed to write missing event item: {e}")
+            missing_item = {
+                "testId": f"run#{test_instrument_run_id}",
+                "sk": missing_sk,
+                "detailType": detail_type,
+                "source": source,
+                "expectedEvent": processed_expected,
+                "status": "missed",
+                "verifiedAt": verifier_at,
+                "expectedOrder": idx,
+            }
+            put_item_to_dynamodb(missing_item)
 
     # Check for unexpected events (events not matched to any expectation)
     unexpected_count = 0
     try:
-        resp = table.query(
+        all_observed_events = get_items_from_dynamodb(
             KeyConditionExpression=Key("testId").eq(f"run#{test_instrument_run_id}")
             & Key("sk").begins_with("event#")
         )
-        all_observed_events = resp.get("Items", [])
 
         # Check each observed event to see if it was matched
         for event_item in all_observed_events:
@@ -557,8 +503,8 @@ def _verify_mode(test_instrument_run_id: str) -> dict:
                 # This event was not matched to any expectation
                 unexpected_count += 1
                 try:
-                    table.update_item(
-                        Key=event_key,
+                    update_item_in_dynamodb(
+                        key=event_key,
                         UpdateExpression="SET #s = :status, verifiedAt = :verifiedAt",
                         ExpressionAttributeNames={"#s": "status"},
                         ExpressionAttributeValues={
@@ -582,7 +528,7 @@ def _verify_mode(test_instrument_run_id: str) -> dict:
 
     # Update run meta status
     try:
-        table.update_item(
+        update_item_in_dynamodb(
             Key={"testId": meta["testId"], "sk": meta["sk"]},
             UpdateExpression="SET #s = :status, verifiedAt = :verifiedAt",
             ExpressionAttributeNames={"#s": "status"},

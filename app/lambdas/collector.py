@@ -24,20 +24,13 @@ No matching logic, no status updates, no knowledge of expectations.
 
 import hashlib
 import json
-import os
 from datetime import datetime, timezone
-from typing import Any, Dict, Optional
 
-import boto3
 import logging
-from services.helper import get_instrumentRunIdMapping, now_iso, get_nested_value
+from services.utils import get_instrumentRunIdMapping, now_iso, get_nested_value
+from services.dynamodb import get_run_meta, put_item_to_dynamodb
+from services.s3 import store_item_to_s3, S3_BUCKET
 
-TABLE_NAME = os.environ["TABLE_NAME"]
-S3_BUCKET = os.environ["S3_BUCKET"]
-
-dynamodb = boto3.resource("dynamodb")
-table = dynamodb.Table(TABLE_NAME)
-s3 = boto3.client("s3")
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
@@ -75,49 +68,11 @@ def _store_event_payload(test_instrument_run_id: str, full_event: dict) -> str:
     key = f"events/testruns/{test_instrument_run_id}/year={yyyy}/month={mm}/day={dd}/{event_detail_type_safe}_{timestamp}.json"
 
     try:
-        s3.put_object(
-            Bucket=S3_BUCKET,
-            Key=key,
-            Body=json.dumps(full_event).encode("utf-8"),
-        )
+        store_item_to_s3(key, json.dumps(full_event))
         return key
     except Exception as e:
-        print(f"[Collector] Failed to store event payload to S3: {e}")
-        return ""
-
-
-def _get_run_meta(test_instrument_run_id: str):
-    """
-    Get run meta from DynamoDB.
-
-    Returns the run meta item or None if not found.
-    """
-    test_id = f"run#{test_instrument_run_id}"
-    key = {"testId": test_id, "sk": "run#meta"}
-
-    try:
-        logger.info(f"[Collector] Querying DynamoDB for testId={test_id}, sk=run#meta")
-        resp = table.get_item(Key=key)
-        item = resp.get("Item")
-
-        if item:
-            print(
-                f"[Collector] Found run meta for testInstrumentRunId={test_instrument_run_id}"
-            )
-        else:
-            print(
-                f"[Collector] No item found in DynamoDB response for testId={test_id}, sk=run#meta"
-            )
-            # Log the full response for debugging
-            logger.info(f"[Collector] DynamoDB response: {json.dumps(resp)}")
-
-        return item
-    except Exception as e:
-        logger.error(
-            f"[Collector] Error querying DynamoDB for testInstrumentRunId={test_instrument_run_id}: {e}"
-        )
-        logger.error(f"[Collector] Query key was: {json.dumps(key)}")
-        return None
+        logger.error(f"[Collector] Failed to store event payload to S3: {e}")
+        raise e
 
 
 def _get_instrument_run_id(event: dict) -> str:
@@ -165,10 +120,12 @@ def handler(event, context):
     # if no, continue with the event
     seeder_events_source = ["orcabus.integrationtests", "orcabus.integrationtests.seed"]
 
+    # step 1: check if the event is a seed event
     if event.get("source") in seeder_events_source:
         logger.info("[Collector] Event is a seed event, ignoring.")
         return {"ignored": True, "reason": "seed_event"}
 
+    # step 2: get the instrument run id from the event
     test_instrument_run_id = _get_instrument_run_id(event)
     if not test_instrument_run_id:
         logger.info(
@@ -180,7 +137,8 @@ def handler(event, context):
         f"[Collector] Found instrument run id for event: {test_instrument_run_id}"
     )
 
-    run_meta = _get_run_meta(test_instrument_run_id)
+    # step 3: get the run meta from the database
+    run_meta = get_run_meta(test_instrument_run_id)
     if not run_meta:
         logger.info(
             f"[Collector] No run meta found for testInstrumentRunId={test_instrument_run_id}, ignoring event."
@@ -194,6 +152,7 @@ def handler(event, context):
         f"[Collector] Successfully found run meta for testInstrumentRunId={test_instrument_run_id}"
     )
 
+    # step 4: store the event in the database
     detail_type = event.get("detail-type", "")
     source = event.get("source", "")
 
@@ -208,7 +167,6 @@ def handler(event, context):
     timestamp_str = now.strftime("%Y%m%dT%H%M%S.%f")[:-3]  # milliseconds
     sk = f"event#{timestamp_str}"
 
-    # Write observed event record to DynamoDB
     event_item = {
         "testId": f"run#{test_instrument_run_id}",
         "sk": sk,
@@ -220,18 +178,14 @@ def handler(event, context):
     }
 
     try:
-        table.put_item(Item=event_item)
-        print(
+        put_item_to_dynamodb(event_item)
+        logger.info(
             f"[Collector] Stored event record for testInstrumentRunId={test_instrument_run_id}, "
             f"detailType={detail_type}, source={source}"
         )
     except Exception as e:
-        print(f"[Collector] Failed to store event record: {e}")
-        return {
-            "testInstrumentRunId": test_instrument_run_id,
-            "stored": False,
-            "error": str(e),
-        }
+        logger.error(f"[Collector] Failed to store event record: {e}")
+        raise e
 
     return {
         "testInstrumentRunId": test_instrument_run_id,
