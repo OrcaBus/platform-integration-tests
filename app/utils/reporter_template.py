@@ -1,11 +1,14 @@
 def load_reporter_template() -> str:
+    """
+    Load reporter template.
+    """
     return """
 <!DOCTYPE html>
         <html lang="en">
           <head>
             <meta charset="UTF-8">
             <meta name="viewport" content="width=device-width, initial-scale=1.0">
-            <title>Integration Test Report - {{ testInstrumentRunId }}</title>
+            <title>Integration Test Report - {{ testId }}</title>
             <style>
               * { box-sizing: border-box; margin: 0; padding: 0; }
               body {
@@ -294,8 +297,8 @@ def load_reporter_template() -> str:
                 </h1>
                 <div class="header-info">
                   <div class="header-info-item">
-                    <strong>Test Instrument Run ID</strong>
-                    <span>{{ testInstrumentRunId }}</span>
+                    <strong>Test ID</strong>
+                    <span>{{ testId }}</span>
                   </div>
                   <div class="header-info-item">
                     <strong>Service</strong>

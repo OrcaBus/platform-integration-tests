@@ -1,7 +1,6 @@
 import logging
 from typing import Any, Dict
-
-from services.eventbridge import events_client, RULE_NAME, EVENT_BUS_NAME
+from services.aws.eventbridge import events_client, RULE_NAME, EVENT_BUS_NAME
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)

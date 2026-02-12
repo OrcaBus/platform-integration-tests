@@ -1,7 +1,8 @@
+# JavaScript
 *.js
 !jest.config.js
 *.d.ts
-node_modules
+*node_modules/
 
 # CDK asset staging directory
 .cdk.staging
@@ -14,3 +15,14 @@ venv/
 # IDE
 .idea
 .DS_Store
+
+# pytest
+*.pytest_cache/
+*.coverage
+*/htmlcov/
+
+# black
+*.black_version
+
+# cursor
+.cursor/

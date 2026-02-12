@@ -64,17 +64,17 @@ Service Description
 
 - **AWS Lambda** (Python)
   - `RuleController` – enables/disables the EventBridge collector rule at the start and end of test runs.
-  - `Seeder` – generates testInstrumentRunId, loads seed fixtures from S3, creates run metadata, and publishes test events to EventBridge.
+  - `Seeder` – uses a **service registry** to dynamically invoke service-specific seed logic (e.g. `SequenceRunManagerService`). Generates test instrument run IDs, loads seed fixtures from S3, creates run metadata, and publishes test events to EventBridge. Supports `serviceName: "all"` to run all registered services.
   - `Collector` – triggered by EventBridge, archives test-mode events to S3 and writes event metadata to DynamoDB.
-  - `Verifier` – compares expected events (from S3) vs. observed events (from DynamoDB) and writes verdict.
-  - `Reporter` – generates an HTML report and stores it in S3.
+  - `Verifier` – uses the same **service registry** to delegate status checks and verification to service-specific classes. Compares expected events (from S3) vs. observed events (from DynamoDB) and writes verdict.
+  - `Reporter` – generates an HTML report for single or multiple services and stores it in S3. Supports `serviceName: "all"` and nested `verifyResult` keyed by service name.
 
 
 - **Amazon DynamoDB**
   - **Single table** that stores:
     - Run metadata (keyed by `testId=run#{testInstrumentRunId}`, `sk=run#meta`)
     - Observed events (keyed by `testId=run#{testInstrumentRunId}`, `sk=event#{timestamp}`)
-    - Missing expected events (keyed by `testId=run#{testInstrumentRunId}`, `sk=expectation#{order}-missing`)
+    - Missing expected events (keyed by `testId=run#{testInstrumentRunId}`, `sk=event#{order}-missing` or `expectation#{order}-missing`)
     - Final verdict (stored in run metadata)
 
 - **Amazon S3**
@@ -97,18 +97,18 @@ Service Description
    Enables or disables the EventBridge collector rule. Called at the start and end of each test run to control when the Collector Lambda receives events.
 
 3. **Seeder (Lambda, Python)**
-   Generates a unique `testInstrumentRunId` (format: `YYMMDD_A00001_XXXX_TESTXXXXXX`), loads seed fixtures from S3, creates run metadata in DynamoDB, and publishes test events to EventBridge with dynamic field replacement (`__replace` configuration).
+   Uses a **service registry** (`app/services/service_registry.py`) to map `serviceName` to service classes (e.g. `SequenceRunManagerService`). Each service implements `execute_seed_process()`. For `serviceName: "all"`, seeds all registered services; otherwise seeds the requested service. Generates unique test instrument run IDs, loads seed fixtures from S3, creates run metadata in DynamoDB, and publishes test events to EventBridge with dynamic field replacement (`__replace` configuration).
 
 4. **Collector (Lambda, Python)**
    Triggered by EventBridge when the collector rule is enabled. Extracts `instrumentRunId` from events, verifies run metadata exists, archives full events to S3, and writes event metadata to DynamoDB. Ignores seed events from specific sources.
 
 5. **Verifier (Lambda, Python)**
-   Runs in two modes:
+   Uses the same **service registry** to delegate to service classes. Each service implements `execute_check_run_status_process()` and `execute_verify_process()`. Runs in two modes:
    - **Status mode**: Checks if all expected events have been observed (called repeatedly during wait loop).
    - **Verify mode**: Loads expectations from S3, matches observed events from DynamoDB using `__match.fields` rules, and writes verdict to DynamoDB.
 
 6. **Reporter (Lambda, Python)**
-   Reads the verdict from DynamoDB, builds an **HTML report** and stores it in **S3**. CI can consume the verdict to approve/block promotion.
+   Reads the verdict from DynamoDB (and `verifyResult` from Step Functions), builds an **HTML report** and stores it in **S3**. Supports `serviceName: "all"` (aggregate report) or a specific service. CI can consume the verdict to approve/block promotion.
 
 ## CI/CD Integration
 
@@ -324,3 +324,4 @@ Service specific terms:
 | Verdict | The pass/fail status and reasons for a test run |
 | `__replace` | Configuration in seed events for dynamic field replacement (randomUniqueIdField, testInstrumentRunIdField, timeStampField) |
 | `__match.fields` | Configuration in expectations that specifies which fields to match when verifying observed events |
+| Service registry | Central mapping (`app/services/service_registry.py`) of service names to service classes. Add a new service by implementing `BaseService` and registering it in `SERVICE_REGISTRY`. |

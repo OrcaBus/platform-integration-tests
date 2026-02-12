@@ -13,5 +13,10 @@ data/
 env/
 .env
 
+# pytest
+.pytest_cache/
 .coverage
 htmlcov/
+
+# black
+.black_version

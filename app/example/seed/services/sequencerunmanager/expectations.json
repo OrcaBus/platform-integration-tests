@@ -14,7 +14,7 @@
       "status": "STARTED"
     },
     "__replace": {
-      "testInstrumentRunIdField": ["detail.instrumentRunId"]
+      "testIdField": ["detail.instrumentRunId"]
     },
     "__match": {
       "fields": [
@@ -42,7 +42,7 @@
       "status": "SUCCEEDED"
     },
     "__replace": {
-      "testInstrumentRunIdField": ["detail.instrumentRunId"]
+      "testRunIdField": ["detail.instrumentRunId"]
     },
     "__match": {
       "fields": [

@@ -85,14 +85,13 @@ class LambdaTestCase(TestCase):
             aws_session_token=f"{uuid.uuid4()}_{uuid.uuid4()}",
         )
 
-        # Patch boto3 clients in services - patch the actual client/resource objects
-        # Note: These patches need to be applied before the services modules are imported
-        # For tests, we'll patch the service functions directly instead
+        # Patch boto3 clients in services.aws - patch the actual client/resource objects
         self.dynamodb_table_patcher = patch(
-            "services.dynamodb.table", mock_dynamodb_resource.Table("test-table")
+            "services.aws.dynamodb.table",
+            mock_dynamodb_resource.Table("test-table"),
         )
-        self.s3_patcher = patch("services.s3.s3", mock_s3)
-        self.eb_patcher = patch("services.eventbridge.events_client", mock_eb)
+        self.s3_patcher = patch("services.aws.s3.s3", mock_s3)
+        self.eb_patcher = patch("services.aws.eventbridge.events_client", mock_eb)
 
         self.dynamodb_table_patcher.start()
         self.s3_patcher.start()
