@@ -240,6 +240,8 @@ export class IntegrationTestsHarnessStack extends Stack {
         action: 'enable',
         serviceName: JsonPath.stringAt('$.serviceName'),
       }),
+      payloadResponseOnly: true,
+      resultPath: '$.enableRuleResult',
     });
 
     // 2. SeedScenario: Seeder will create testInstrumentRunId + meta + slot items, and emit seed events.
@@ -258,13 +260,14 @@ export class IntegrationTestsHarnessStack extends Stack {
     const checkRunStatusTask = new LambdaInvoke(this, 'CheckRunStatus', {
       lambdaFunction: verifier,
       payload: TaskInput.fromObject({
-        testInstrumentRunId: JsonPath.stringAt('$.seedResult.testInstrumentRunId'),
+        serviceName: JsonPath.stringAt('$.enableRuleResult.serviceName'),
+        seedResult: JsonPath.objectAt('$.seedResult'),
         mode: 'status',
       }),
       payloadResponseOnly: true,
       // Expect verifier to return:
-      // { status: "running|ready|timeout", runId: "...", observedCount, expectedCount }
-      resultPath: '$.status',
+      // {serviceName: { status: "running|ready|timeout", runId: "...", observedCount, expectedCount }}
+      resultPath: '$.checkRunStatusResult',
     });
 
     // 4. Wait X seconds (reduced to 30 seconds for more frequent timeout checks)
@@ -276,7 +279,8 @@ export class IntegrationTestsHarnessStack extends Stack {
     const verifyTask = new LambdaInvoke(this, 'VerifyRun', {
       lambdaFunction: verifier,
       payload: TaskInput.fromObject({
-        testInstrumentRunId: JsonPath.stringAt('$.seedResult.testInstrumentRunId'),
+        serviceName: JsonPath.stringAt('$.enableRuleResult.serviceName'),
+        seedResult: JsonPath.objectAt('$.seedResult'),
         mode: 'verify',
       }),
       payloadResponseOnly: true,
@@ -288,10 +292,8 @@ export class IntegrationTestsHarnessStack extends Stack {
     const reportTask = new LambdaInvoke(this, 'ReportRun', {
       lambdaFunction: reporter,
       payload: TaskInput.fromObject({
-        testInstrumentRunId: JsonPath.stringAt('$.seedResult.testInstrumentRunId'),
+        serviceName: JsonPath.stringAt('$.enableRuleResult.serviceName'),
         verifyResult: JsonPath.stringAt('$.verifyResult'),
-        // safe if you always document that callers pass serviceName or Seeder sets it in seedResult
-        serviceName: JsonPath.stringAt('$.seedResult.serviceName'),
       }),
       payloadResponseOnly: true,
       resultPath: '$.reportResult',
@@ -302,14 +304,15 @@ export class IntegrationTestsHarnessStack extends Stack {
       lambdaFunction: ruleController,
       payload: TaskInput.fromObject({
         action: 'disable',
+        serviceName: JsonPath.stringAt('$.enableRuleResult.serviceName'),
       }),
       payloadResponseOnly: true,
-      resultPath: JsonPath.DISCARD,
+      resultPath: '$.disableRuleResult',
     });
 
     // 8. Final state
     const finalState = new Pass(this, 'Done', {
-      resultPath: '$.final',
+      resultPath: '$.finalResult',
     });
 
     // verify -> report -> disable -> done chain (only when ready/timeout)

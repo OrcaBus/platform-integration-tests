@@ -18,15 +18,25 @@ Everything runs as a **serverless test harness**:
 
 ## Components
 
-The application code is organised around five Lambda functions:
+The application code is organised around five Lambda functions and a **service registry** for extensibility:
 
 1. **RuleController** – enables/disables the EventBridge collector rule at the start and end of test runs.
-2. **Seeder** – generates testInstrumentRunId, loads seed fixtures from S3, creates run metadata in DynamoDB, and publishes test events to OrcaBus.
+2. **Seeder** – uses the **service registry** to delegate to service-specific classes (e.g. `SequenceRunManagerService`). Each service implements `execute_seed_process()`. Generates test instrument run IDs, loads seed fixtures from S3, creates run metadata in DynamoDB, and publishes test events to OrcaBus.
 3. **Collector** – triggered by EventBridge when the collector rule is enabled, archives full events to S3 and writes event metadata to DynamoDB (lightweight archival only).
-4. **Verifier** – evaluates whether the observed events satisfy the expectations and writes verdicts to DynamoDB.
-5. **Reporter** – generates an HTML report for a test run and stores it in S3.
+4. **Verifier** – uses the **service registry** to delegate to service classes. Each service implements `execute_check_run_status_process()` and `execute_verify_process()`. Evaluates whether the observed events satisfy the expectations and writes verdicts to DynamoDB.
+5. **Reporter** – generates an HTML report for single or multiple services, supports `serviceName: "all"` for aggregate reports, and stores reports in S3.
 
 There is also an **orchestrating Step Functions state machine** defined in CDK that wires these Lambdas together.
+
+### Service Registry
+
+The **service registry** (`app/services/service_registry.py`) maps service names to their implementation classes. To add a new service:
+
+1. Create a class that extends `BaseService` and implements `execute_seed_process()`, `execute_check_run_status_process()`, `execute_verify_process()`, and `execute_report_process()`.
+2. Register it in `SERVICE_REGISTRY` in `service_registry.py`.
+3. Add the service name to `AVAILABLE_SERVICES` in `app/utils/config.py`.
+
+The Seeder, Verifier, and Reporter will automatically pick up the new service when `serviceName: "all"` or the specific service name is requested.
 
 ---
 
@@ -52,12 +62,12 @@ EnableCollectorRule (RuleController Lambda)
 
 ```jsonc
 {
-  "serviceName": "workflowrunmanager"  // or "all" or omitted
+  "serviceName": "workflowrunmanager"  // or "all"
 }
 ```
 
-- `serviceName = "all"` or omitted → seed **all** services scenario.
-- `serviceName = "<service>"` → seed only the fixtures for that service.
+- `serviceName = "all"` → seed **all registered services** (each service runs its own `execute_seed_process()`).
+- `serviceName = "<service>"` → seed only that service (must be in `SERVICE_REGISTRY`).
 
 ### State machine behaviour
 
@@ -66,96 +76,87 @@ EnableCollectorRule (RuleController Lambda)
    - The rule routes all `testMode` events from OrcaBus into the **Collector** Lambda.
 
 2. **SeedScenario (Seeder Lambda)**
-   - Generates a unique `testInstrumentRunId` (format: `YYMMDD_A00001_XXXX_TESTXXXXXX`, e.g., `260122_A00001_1234_TEST123456`).
-   - Resolves `serviceName` (normalising and falling back to `all` if specific seeds are missing).
-   - Loads seed fixtures from S3 (`seeds.json` only; expectations are loaded by Verifier).
-   - Writes:
-     - One **run meta** item (`testId=run#{testInstrumentRunId}`, `sk=run#meta`) in DynamoDB.
+   - Uses the **service registry** to create a service instance (`create_service_instance(serviceName)`) and call `execute_seed_process()`.
+   - For `serviceName: "all"`: runs all registered services and returns `{ "sequencerunmanager": {...}, "workflowrunmanager": {...}, ... }`.
+   - For a specific service: returns `{ "workflowrunmanager": {...} }`.
+   - Each service generates a unique `seedInstrumentRunId` (format: `YYMMDD_A00001_XXXX_TESTXXXXXX`, e.g., `260122_A00001_1234_TESTSRM123`).
+   - Loads seed fixtures from S3 (`seeds.json` for that service).
+   - Writes one **run meta** item per service (`testId=run#{seedInstrumentRunId}`, `sk=run#meta`) in DynamoDB.
    - Publishes test events to the EventBridge bus sequentially with a 1-second delay between events (simulating real service behaviour).
    - Applies dynamic field replacement using `__replace` configuration:
      - `randomUniqueIdField`: Generates random unique IDs for specified fields
-     - `testInstrumentRunIdField`: Replaces with the generated testInstrumentRunId
+     - `testInstrumentRunIdField`: Replaces with the generated seed instrument run ID
      - `timeStampField`: Replaces with current timestamp
-   - Returns:
+   - Returns (for single service):
 
      ```json
      {
-       "testInstrumentRunId": "260122_A00001_1234_TEST123456",
-       "serviceName": "workflowrunmanager",
-       "startedAt": "...",
-       "timeoutAt": "...",
-       "publishedCount": 5
+       "workflowrunmanager": {
+         "seedInstrumentRunId": "260122_A00001_1234_TESTWRM123",
+         "serviceName": "workflowrunmanager",
+         "startedAt": "...",
+         "timeoutAt": "...",
+         "publishedCount": 5
+       }
      }
      ```
 
 3. **Wait / Status Loop (Verifier in "status" mode)**
-   - The state machine waits 1 minute, then calls Verifier with:
+   - The state machine waits, then calls Verifier with:
 
      ```json
-     { "testInstrumentRunId": "260122_A00001_1234_TEST123456", "mode": "status" }
-     ```
-     Note: Also accepts `testRunId` or `runId` for backward compatibility.
-
-   - Verifier loads expectations from S3 to count expected events, counts observed events from DynamoDB, and returns:
-
-     ```json
-     {
-       "status": "running|ready|timeout|unknown",
-       "runId": "260122_A00001_1234_TEST123456",
-       "observedCount": 3,
-       "expectedCount": 5
-     }
+     { "serviceName": "workflowrunmanager", "seedResult": { "workflowrunmanager": { "seedInstrumentRunId": "..." } }, "mode": "status" }
      ```
 
-   - Loop continues while `status = "running"`.
-   - Exits the loop when `status = "ready"` (all expected events observed) or `status = "timeout"`.
+   - Verifier uses the **service registry** to delegate to each service's `execute_check_run_status_process()`.
+   - For `serviceName: "all"`: returns `{ "sequencerunmanager": {...}, "workflowrunmanager": {...}, ... }`.
+   - For single service: returns `{ "workflowrunmanager": { "status": "running|ready|timeout", "runId": "...", "observedCount": 3, "expectedCount": 5 } }`.
+   - Loop continues while any service has `status = "running"`.
+   - Exits the loop when all services are `ready` or any has `timeout`.
 
 4. **VerifyRun (Verifier in "verify" mode)**
    - Called once the run is `ready` or `timeout`:
 
      ```json
-     { "testInstrumentRunId": "260122_A00001_1234_TEST123456", "mode": "verify" }
+     { "serviceName": "workflowrunmanager", "seedResult": { "workflowrunmanager": { "seedInstrumentRunId": "..." } }, "mode": "verify" }
      ```
-     Note: Also accepts `testRunId` or `runId` for backward compatibility.
 
-   - Verifier loads `expectations.json` from S3, queries DynamoDB for observed events, matches them using `__match.fields` rules, and writes results:
-
-     ```json
-     {
-       "runId": "260122_A00001_1234_TEST123456",
-       "runStatus": "passed|failed",
-       "matchedCount": 4,
-       "missingCount": 1,
-       "unexpectedCount": 0,
-       "totalExpected": 5
-     }
-     ```
+   - Verifier delegates to each service's `execute_verify_process()`.
+   - For `serviceName: "all"`: returns `{ "sequencerunmanager": {...}, "workflowrunmanager": {...}, ... }`.
+   - Each service result includes `runId`, `runStatus`, `matchedCount` (or `matchedEventsCount`), `missingCount` (or `missingEventsCount`), `unexpectedCount` (or `unexpectedEventsCount`), `totalExpected` (or `totalExpectedEventsCount`).
 
 5. **ReportRun (Reporter)**
    - Reporter receives:
 
      ```json
      {
-       "testInstrumentRunId": "260122_A00001_1234_TEST123456",
-       "serviceName": "workflowrunmanager",
-       "verifyResult": { ... }
+       "serviceName": "all" | "workflowrunmanager",
+       "verifyResult": {
+         "workflowrunmanager": {
+           "runId": "260122_A00001_1234_TESTWRM123",
+           "runStatus": "passed",
+           "matchedCount": 5,
+           "missingCount": 0,
+           "unexpectedCount": 0,
+           "totalExpected": 5
+         }
+       }
      }
      ```
-     Note: Also accepts `testRunId` or `runId` for backward compatibility.
 
-   - Generates an HTML report and stores it in S3 at:
-
-     ```text
-     reports/testruns/{serviceName}/{YYYY}/{MM}/{DD}/{timestamp}-{testInstrumentRunId}.html
-     ```
-
-   - Returns the S3 location (`bucket`, `key`, `url`) to the state machine.
+   - For `serviceName: "all"`: `verifyResult` is keyed by service name; Reporter aggregates and generates one combined HTML report.
+   - For single service: `verifyResult` contains that service's result (nested under service name or flat).
+   - Report path:
+     - Single service: `reports/testruns/year={YYYY}/month={MM}/day={DD}/{serviceName}/{testId}-{timestamp}.html`
+     - All services: `reports/testruns/year={YYYY}/month={MM}/day={DD}/all/all-{timestamp}.html`
+   - Template context uses `testId` (comma-separated for "all").
+   - Returns the S3 location (`bucket`, `key`, `reportUrl`) to the state machine.
 
 6. **DisableCollectorRule**
    - Disables the EventBridge rule again so the collector only runs during active test windows.
 
 7. **Done**
-   - The state machine returns a final payload including `testInstrumentRunId`, `serviceName`, and the verification + report information.
+   - The state machine returns a final payload including `seedResult`, `verifyResult`, `reportResult`, and `serviceName`.
 
 ---
 
@@ -196,21 +197,31 @@ EnableCollectorRule (RuleController Lambda)
 
 ```jsonc
 {
-  "serviceName": "workflowrunmanager"  // optional, default "all"
+  "Payload": {
+    "serviceName": "workflowrunmanager"  // optional, default "all"
+  }
 }
 ```
 
 **Responsibilities:**
 
-- Generate a unique `testInstrumentRunId` (format: `YYMMDD_A00001_XXXX_TESTXXXXXX`, e.g., `260122_A00001_1234_TEST123456`).
-- Resolve `serviceName` (if service-specific fixtures don't exist, fall back to `"all"`).
-- Load seed events from S3 (`seed/services/{serviceName}/seeds.json`).
-- Create a **run meta item** in DynamoDB (`testId=run#{testInstrumentRunId}`, `sk=run#meta`).
-- Apply dynamic field replacement using `__replace` configuration in seed events:
-  - `randomUniqueIdField`: Generates random unique IDs (with optional prefix/suffix formatting)
-  - `testInstrumentRunIdField`: Replaces specified fields with the generated testInstrumentRunId
-  - `timeStampField`: Replaces specified fields with current ISO timestamp
-- Publish test events to EventBridge sequentially with a 1-second delay between events (simulating real service behaviour).
+- Use the **service registry** (`create_service_instance(serviceName)`) to get the service class and call `execute_seed_process()`.
+- For `serviceName: "all"`: process all services in `AVAILABLE_SERVICES` (except `"all"`); only services registered in `SERVICE_REGISTRY` are executed.
+- For a specific service: process only that service (must be registered).
+- Each service:
+  - Generates a unique `seedInstrumentRunId` (format: `YYMMDD_A00001_XXXX_TESTSRMXXX`, e.g., `260122_A00001_1234_TESTSRM123`).
+  - Loads seed events from S3 (`seed/services/{serviceName}/seeds.json`).
+  - Creates a **run meta item** in DynamoDB (`testId=run#{seedInstrumentRunId}`, `sk=run#meta`).
+  - Applies dynamic field replacement using `__replace` configuration in seed events:
+    - `randomUniqueIdField`: Generates random unique IDs (with optional prefix/suffix formatting)
+    - `testInstrumentRunIdField`: Replaces specified fields with the generated seed instrument run ID
+    - `timeStampField`: Replaces specified fields with current ISO timestamp
+  - Publishes test events to EventBridge sequentially with a 1-second delay between events (simulating real service behaviour).
+
+**Output:**
+
+- For `serviceName: "all"`: `{ "sequencerunmanager": { seedInstrumentRunId, serviceName, startedAt, timeoutAt, publishedCount }, ... }`
+- For single service: `{ "workflowrunmanager": { seedInstrumentRunId, serviceName, startedAt, timeoutAt, publishedCount } }`
 
 The Collector extracts `instrumentRunId` from events using a mapping based on `detail-type` to identify which events belong to a specific test run.
 
@@ -270,49 +281,33 @@ The collector performs lightweight archival only (no matching logic):
 
 ## 5. Verifier (Lambda, Python)
 
-Verifier runs in two modes: **status** and **verify**.
+Verifier uses the **service registry** to delegate to service classes. Each service implements `execute_check_run_status_process()` and `execute_verify_process()`. Verifier runs in two modes: **status** and **verify**.
 
 ### Status Mode
 
 **Input:**
 
 ```jsonc
-{ "testInstrumentRunId": "260122_A00001_1234_TEST123456", "mode": "status" }
+{
+  "serviceName": "workflowrunmanager" | "all",
+  "seedResult": { "workflowrunmanager": { "seedInstrumentRunId": "..." } },  // or multiple services for "all"
+  "mode": "status"
+}
 ```
-Note: Also accepts `testRunId` or `runId` for backward compatibility.
 
 **Responsibilities:**
 
-- Load the **run meta item**:
+- For each service (from `serviceName` or `seedResult`):
+  - Create service instance and call `execute_check_run_status_process(event)`.
+  - Load the **run meta item** for that service's `seedInstrumentRunId`.
+  - Count observed events from DynamoDB (query by `testId`, `sk` begins with `event#`; no filter when counting all).
+  - Decide:
+    - If now >= `timeoutAt` → mark status `timeout` and return `"timeout"`.
+    - Else if `observedCount >= expectedCount` → mark status `ready`.
+    - Else → status stays `running`.
 
-  ```jsonc
-  {
-    "testId": "run#260122_A00001_1234_TEST123456",
-    "sk": "run#meta",
-    "serviceName": "workflowrunmanager",
-    "observedCount": 3,
-    "status": "running",
-    "startedAt": "...",
-    "timeoutAt": "..."
-  }
-  ```
-
-- Decide:
-
-  - If now >= `timeoutAt` → mark status `timeout` and return `"timeout"`.
-  - Else if `observedCount >= expectedSlots` → mark status `ready`.
-  - Else → status stays `running`.
-
-- Output:
-
-  ```jsonc
-  {
-    "status": "running|ready|timeout|unknown",
-    "runId": "it-1234",
-    "observedCount": 3,
-    "expectedSlots": 5
-  }
-  ```
+- Output (single service): `{ "workflowrunmanager": { "status": "running|ready|timeout", "runId": "...", "observedCount": 3, "expectedCount": 5 } }`
+- Output (`serviceName: "all"`): `{ "sequencerunmanager": {...}, "workflowrunmanager": {...}, ... }`
 
 The Step Functions loop uses this to decide when to move on to full verification.
 
@@ -321,43 +316,38 @@ The Step Functions loop uses this to decide when to move on to full verification
 **Input:**
 
 ```jsonc
-{ "testInstrumentRunId": "260122_A00001_1234_TEST123456", "mode": "verify" }
+{
+  "serviceName": "workflowrunmanager" | "all",
+  "seedResult": { "workflowrunmanager": { "seedInstrumentRunId": "..." } },
+  "mode": "verify"
+}
 ```
-Note: Also accepts `testRunId` or `runId` for backward compatibility.
 
-**Responsibilities:**
+**Responsibilities (per service, via `execute_verify_process()`):**
 
-1. **Load expectations from S3**
-   - Loads `expectations.json` from `seed/services/{serviceName}/expectations.json`.
+1. **Load expectations from S3** – `seed/services/{serviceName}/expectations.json`.
 
 2. **For each expected event (in order):**
-   - Query DynamoDB for observed events matching `testId=run#{testInstrumentRunId}`, `detailType`, and `source`.
+   - Query DynamoDB for observed events matching `testId=run#{seedInstrumentRunId}`, `detailType`, and `source`.
    - Download full event body from S3 using `rawS3Key`.
    - Apply match rules based on `expectation.__match.fields` (dot-notation paths like `"detail.instrumentRunId"`).
-   - If matched:
-     - Write match info to the event item: `status=matched`, `verifierAt`, `expectedOrder`, `expectedEvent`.
-   - If not matched:
-     - Write missing event item to DynamoDB: `testId=run#{testInstrumentRunId}`, `sk=expectation#{order}-missing`, `detailType`, `source`, `expectedEvent`, `status=missed`, `verifierAt`, `expectedOrder`.
+   - If matched: Write match info to the event item: `status=matched`, `verifiedAt`, `expectedOrder`, `expectedEvent`.
+   - If not matched: Write missing event item: `sk=event#{order}-missing` (or `expectation#{order}-missing`), `status=missed`.
 
-3. **Check for unexpected events**
-   - After all expected events are checked, query DynamoDB for any observed events that weren't matched.
-   - Mark them as `status=unexpected`.
+3. **Check for unexpected events** – Query for observed events not matched; mark as `status=unexpected`.
 
-4. **Determine overall run status**
-   - If any missing or unexpected events → `runStatus = "failed"`.
-   - If run meta status is `timeout` → `runStatus = "failed"`.
-   - Otherwise → `runStatus = "passed"`.
+4. **Determine run status** – `runStatus = "failed"` if missing, unexpected, or timeout; otherwise `"passed"`.
 
-5. **Update run meta and return:**
+5. **Return (per service):**
 
   ```jsonc
   {
-    "runId": "260122_A00001_1234_TEST123456",
+    "runId": "260122_A00001_1234_TESTSRM123",
     "runStatus": "passed|failed",
-    "matchedCount": 5,
-    "missingCount": 0,
-    "unexpectedCount": 0,
-    "totalExpected": 5
+    "matchedCount": 5,       // or matchedEventsCount
+    "missingCount": 0,       // or missingEventsCount
+    "unexpectedCount": 0,    // or unexpectedEventsCount
+    "totalExpected": 5       // or totalExpectedEventsCount
   }
   ```
 
@@ -369,48 +359,37 @@ Note: Also accepts `testRunId` or `runId` for backward compatibility.
 
 ```jsonc
 {
-  "testInstrumentRunId": "260122_A00001_1234_TEST123456",
-  "serviceName": "workflowrunmanager",
+  "serviceName": "all" | "workflowrunmanager",
   "verifyResult": {
-    "runId": "260122_A00001_1234_TEST123456",
-    "runStatus": "passed",
-    "matchedCount": 5
+    "workflowrunmanager": {
+      "runId": "260122_A00001_1234_TESTWRM123",
+      "runStatus": "passed",
+      "matchedCount": 5,
+      "missingCount": 0,
+      "unexpectedCount": 0,
+      "totalExpected": 5
+    }
   }
 }
 ```
-Note: Also accepts `testRunId` or `runId` for backward compatibility.
+
+Note: `verifyResult` may be a JSON string (from `JsonPath.stringAt`) or an object. Reporter parses it if needed. Supports both key naming conventions (`matchedCount` / `matchedEventsCount`, etc.).
 
 **Responsibilities:**
 
-- Load run meta from DynamoDB (`testId=run#{testInstrumentRunId}`, `sk=run#meta`) to get additional details (`startedAt`, `verifiedAt`, etc.).
+- For `serviceName: "all"`: aggregate `verifyResult` across all services, collect events from each `runId`, generate one combined HTML report.
+- For single service: use that service's result from `verifyResult[serviceName]` (or flat structure).
+- Load run meta from DynamoDB for each `runId` to get `startedAt`, `verifiedAt`.
 - Query DynamoDB for:
-  - Matched events (`testId=run#{testInstrumentRunId}`, `sk` begins with `event#`, `status=matched`)
-  - Missing events (`testId=run#{testInstrumentRunId}`, `sk` begins with `expectation#`, `status=missed`)
-  - Unexpected events (`testId=run#{testInstrumentRunId}`, `sk` begins with `event#`, `status=unexpected`)
-- Generate an HTML report with detailed tables showing matched, missing, and unexpected events.
-- Store the report in S3 with a **timestamp-first filename**:
-
-  ```text
-  reports/testruns/{serviceName}/{YYYY}/{MM}/{DD}/{timestamp}-{testInstrumentRunId}.html
-  ```
-
-  Example:
-
-  ```text
-  reports/testruns/workflowrunmanager/2025/11/21/
-    2025-11-21T10-15-32Z-260122_A00001_1234_TEST123456.html
-  ```
-
-- Update `run#meta` with `reportS3Key`.
-- Return the S3 location to the state machine:
-
-  ```jsonc
-  {
-    "bucket": "<S3_BUCKET>",
-    "key": "reports/testruns/workflowrunmanager/2025/11/21/2025-11-21T10-15-32Z-260122_A00001_1234_TEST123456.html",
-    "url": "s3://<S3_BUCKET>/reports/testruns/workflowrunmanager/2025/11/21/2025-11-21T10-15-32Z-260122_A00001_1234_TEST123456.html"
-  }
-  ```
+  - Matched events (`testId=run#{runId}`, `sk` begins with `event#`, `status=matched`)
+  - Missing events (`testId=run#{runId}`, `sk` begins with `event#`, `status=missed`)
+  - Unexpected events (`testId=run#{runId}`, `sk` begins with `event#`, `status=unexpected`)
+- Generate an HTML report with detailed tables. Template context uses `testId` (comma-separated for "all").
+- Store the report in S3:
+  - Single: `reports/testruns/year={YYYY}/month={MM}/day={DD}/{serviceName}/{testId}-{timestamp}.html`
+  - All: `reports/testruns/year={YYYY}/month={MM}/day={DD}/all/all-{timestamp}.html`
+- Update each `run#meta` with `reportS3Key`.
+- Return: `{ "bucket": "...", "key": "...", "reportUrl": "s3://..." }`
 
 ---
 
@@ -449,12 +428,13 @@ s3://<bucket>/
       per_service.html          # Optional service-specific template(s)
 
     testruns/
-      all/
-        2025/11/21/2025-11-21T09-30-00Z-260122_A00001_0001_TEST000001.html
-      workflowrunmanager/
-        2025/11/21/2025-11-21T10-15-32Z-260122_A00001_1234_TEST123456.html
-      <other-service>/
-        ...
+      year=2025/month=11/day=21/
+        all/
+          all-2025-11-21T10-15-32Z.html
+        workflowrunmanager/
+          260122_A00001_1234_TESTWRM123-2025-11-21T10-15-32Z.html
+        sequencerunmanager/
+          260122_A00001_1234_TESTSRM123-2025-11-21T10-15-32Z.html
 ```
 
 **Seed files format (example):**
@@ -539,7 +519,7 @@ We use a **single DynamoDB table** for everything (configured via `TABLE_NAME` e
 - **Sort key (`sk`)**:
   - `run#meta` for the run metadata item.
   - `event#{timestamp}` for observed events (from Collector).
-  - `expectation#{order}-missing` for missing expected events (from Verifier).
+  - `event#{order}-missing` or `expectation#{order}-missing` for missing expected events (from Verifier).
 
 ### Example Partition for One Run
 
@@ -573,10 +553,10 @@ testId = "run#260122_A00001_1234_TEST123456"
 │      "expectedEvent": { ... }  // full expectation from expectations.json
 │    }
 │
-└─ sk = "expectation#001-missing"
+└─ sk = "event#001-missing"
      {
        "testId": "run#260122_A00001_1234_TEST123456",
-       "sk": "expectation#001-missing",
+       "sk": "event#001-missing",
        "detailType": "SequenceRunStateChange",
        "source": "orcabus.sequencerunmanager",
        "expectedEvent": { ... },  // full expectation from expectations.json
@@ -622,7 +602,7 @@ testId = "run#260122_A00001_1234_TEST123456"
 | Attribute          | Type | Description                                                 |
 |--------------------|------|-------------------------------------------------------------|
 | `testId`           | S    | `run#{testInstrumentRunId}`                                 |
-| `sk`               | S    | `expectation#{order}-missing` (e.g., `expectation#001-missing`) |
+| `sk`               | S    | `event#{order}-missing` or `expectation#{order}-missing` (e.g., `event#001-missing`) |
 | `detailType`       | S    | Expected detail-type                                        |
 | `source`           | S    | Expected source                                             |
 | `expectedEvent`    | M    | Full expectation object from expectations.json              |

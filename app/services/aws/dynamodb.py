@@ -18,25 +18,25 @@ dynamodb = boto3.resource("dynamodb")
 table = dynamodb.Table(TABLE_NAME)
 
 
-def get_run_meta(test_instrument_run_id: str) -> Optional[Dict[str, Any]]:
+def get_run_meta(test_id: str) -> Optional[Dict[str, Any]]:
     """
     Get run meta from DynamoDB.
 
     Args:
-        test_instrument_run_id: The test instrument run ID (format: YYMMDD_A00001_XXXX_TESTXXXXXX)
+        test_id: The test ID (format: run#YYMMDD_A00001_XXXX_TESTXXXXXX)
 
     Returns:
         The run meta item if found, None otherwise
 
-    Example:
-        >>> meta = get_run_meta("260122_A00001_1234_TEST123456")
+    Example with instrument run id:
+        >>> meta = get_run_meta("run#260122_A00001_1234_TEST123456")
         >>> print(meta["status"])
         "running"
     """
-    if not test_instrument_run_id:
-        raise ValueError("test_instrument_run_id is required")
-    test_id = f"run#{test_instrument_run_id}"
-    key = {"testId": test_id, "sk": "run#meta"}
+    if not test_id:
+        logger.error(f"test_id is required")
+        raise ValueError("test_id is required")
+    key = {"testId": f"run#{test_id}", "sk": "run#meta"}
     return get_item_from_dynamodb(key)
 
 
@@ -107,7 +107,7 @@ def get_items_from_dynamodb(
         raise e
 
 
-def update_item_in_dynamodb(
+def update_item_to_dynamodb(
     key: Dict[str, Any],
     UpdateExpression: str,
     ExpressionAttributeNames: Dict[str, str],
@@ -135,3 +135,31 @@ def update_item_in_dynamodb(
     except Exception as e:
         logger.error(f"Failed to update item in DynamoDB: {e}")
         raise e
+
+
+def get_observed_events(
+    test_id: str, detail_type: str, source: str
+) -> List[Dict[str, Any]]:
+    """
+    Query DynamoDB for observed events matching test_id, detail_type, and source.
+    Returns list of dynamoDB event items (with rawS3Key).
+
+    Args:
+        test_id: The test ID (with format: "run#YYMMDD_A00001_XXXX_TESTXXXXXX")
+        detail_type: The event detail type (empty string to get all events)
+        source: The event source (empty string to get all events)
+    Returns:
+        List of dynamoDB event items (with rawS3Key).
+    """
+    if detail_type and source:
+        return get_items_from_dynamodb(
+            KeyConditionExpression=Key("testId").eq(test_id)
+            & Key("sk").begins_with("event#"),
+            FilterExpression=Attr("detailType").eq(detail_type)
+            & Attr("source").eq(source),
+        )
+    else:
+        return get_items_from_dynamodb(
+            KeyConditionExpression=Key("testId").eq(test_id)
+            & Key("sk").begins_with("event#"),
+        )
